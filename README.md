@@ -30,10 +30,11 @@ tokens/sec  =  effective_bandwidth  /  active_bytes_per_token
 Literal one-parameter-at-a-time I/O is impossible — an SSD's minimum transfer
 is a 4 KB page at ~80 µs. The library separates the two granularities:
 
-- **Streamed projections use blocks of output neurons.** The default 235B
-  runner requests up to 4,096 rows per block and keeps the next blocks in
-  flight. Blocks shrink when necessary to fit the pipeline — `lookahead + 1`
-  raw I/O buffers — inside the arena.
+- **Streamed projections use blocks of output neurons.** A block is a
+  contiguous run of rows — rows *are* output neurons, and GGUF stores each row
+  as a whole number of quantization blocks, so a row range is one sequential
+  read and one independent dequant. Blocks shrink when necessary to fit the
+  pipeline — `lookahead + 1` raw I/O buffers — inside the arena.
 - **Resident projections can use a whole-matrix fused kernel.** Frequently
   used weights stay cached in RAM or VRAM instead of being read again.
 - **MoE routing picks which neurons to read.** The router names the active
@@ -48,6 +49,63 @@ is a 4 KB page at ~80 µs. The library separates the two granularities:
 This is block streaming, not literal one-neuron-at-a-time loading. The
 streaming arena bounds its raw I/O reservations; resident caches, expanded
 weights, activations, and the KV cache also require memory.
+
+**Smaller blocks are not automatically better.** The 0.39 MB peak above is a
+memory result from a single-matrix microbenchmark, not a speed
+recommendation — in the full model 128-row blocks were the *slowest* setting
+tested, because per-block cost (a future, a host→device copy, a kernel
+launch, ~456k times a run) outgrew the I/O it saved. Block size trades I/O
+stall against per-block overhead, and the measured optimum here is 512 rows.
+See [Tuning blocks and caching](#tuning-blocks-and-caching).
+
+## How it works
+
+One decode step, end to end, with the code that does each part:
+
+**1. Placement — `residency/planner.py`, `residency/cache.py`.**
+Before the first token, `plan()` assigns every tensor to VRAM, RAM, or disk.
+`TieredCache` runs three policies rather than the obvious two: *VRAM-Q* keeps
+raw quantized bytes on the GPU and expands them per access (the default, since
+a Q4 model is 4.5 bits/weight on disk but 16 as fp16), *VRAM-F* keeps tensors
+that are already float, and *RAM* holds quantized bytes on the host. For
+GPT-OSS-120B this puts all 2.3 GB of non-expert weights resident with a 100%
+hit rate; the 61 GB of experts cannot fit anywhere and stream.
+
+**2. Routing — `moe/router.py`, `model/gpt_oss.py`.**
+The router runs first and names which experts this token needs. Only those are
+read. GPT-OSS activates 4 of 128, turning a 63.4 GB model into ~1.9 GB of
+expert reads per token.
+
+**3. Prefetch planning — `compute/blockffn.py:BlockPrefetcher`.**
+Because routing already named every expert the layer will touch, one plan
+covers the whole layer: all active experts × gate/up/down, in the order they
+will be consumed, chopped into blocks. The prefetcher keeps `depth` blocks in
+flight and refills as each retires, so a block finishing in `ffn_gate`
+immediately pulls in one belonging to `ffn_down` or the next expert. Windows
+the slab cache already holds are skipped rather than re-read.
+
+**4. Streaming — `compute/blockffn.py:stream_linear`.**
+Walks a row window of a weight matrix: read a block, multiply, accumulate,
+retire it, take the next. `row_start`/`row_end` bound the walk, which is what
+makes one expert streamable — its rows are a contiguous window inside the
+stacked `(n_expert, out, in)` tensor. The same loop serves disk, RAM and VRAM,
+which is why residency stays invisible to the model code.
+
+**5. Compute — `compute/triton_kernels.py`.**
+On the decode path a fused dequant-GEMV multiplies straight from the quantized
+bytes, so a block's weights are never materialised as floats.
+
+**6. The ceiling — `io/arena.py`.**
+Every in-flight block holds a byte reservation. The arena blocks allocation
+until one retires, which back-pressures the prefetcher instead of letting it
+run away. This is what makes the memory bound hold regardless of model size.
+
+The FFN needs one extra step. `ffn_down` is stored `(n_embd, n_ffn)`, so
+slicing it *by neuron* would mean strided column reads — the access pattern
+this drive punishes. Instead the FFN runs in two row-contiguous phases: walk
+gate/up by neuron to get activations, then walk down by output dimension.
+Activations are floats per token — kilobytes, not gigabytes — so materialising
+them between phases costs nothing.
 
 ## Tuning blocks and caching
 
@@ -71,6 +129,23 @@ warmup, pinning, and prefill. It does not clear the OS file cache. Short-run
 timings and hot-expert cache benefits depend on the prompt; repeat runs before
 treating small differences as improvements. A larger expert cache also leaves
 less VRAM for ordinary projections, so increasing it can cause extra reads.
+
+Two habits this project learned the hard way, both from measurements that were
+individually correct and jointly misleading:
+
+- **Tune against the whole model, not one matrix.** A single-matrix
+  microbenchmark ranked 128-row blocks fastest; in the full model they were
+  slowest. The microbenchmark measured I/O in isolation and never saw
+  per-block overhead accumulate over ~2,600 blocks a token.
+- **A short decode overstates sustained throughput.** Every figure below and
+  in the GPT-OSS table is a 16-token run immediately after warmup, when the
+  pinned experts still match what warmup routed to. A ~450-token generation
+  sustained about 63% of the short-run rate. Prefill is far more
+  reproducible — under 2% spread across runs, against ~20% for a 16-token
+  decode — so prefer it when comparing configurations.
+
+The block and prefetch numbers for GPT-OSS-120B are in
+[the GPT-OSS section](#gpt-oss-120b); the table below is the 235B model.
 
 On the RTX 5050 Laptop GPU, the September 11 tuning run measured the following
 with the 235B model, a 1 GB I/O budget, 7 GB VRAM budget (including 1.5 GB
@@ -168,6 +243,22 @@ warmup gives **85.7%** slab hit-rate on the *same* prompt but only **37.5%**
 on a different one. Warmup-based pinning helps; it does not generalise as
 much as the aggregate skew suggests.
 
+**Queue depth is a scheduling property, not a parameter.** Raising
+`--expert-lookahead` from 4 to 8 changed nothing, because a 2,880-row window
+at 1,024 rows per block is only *three* blocks — the pipeline had nothing more
+to queue. What mattered was where the pipeline ended: one per projection meant
+432 drains per token. A prefetch plan spanning the whole layer took stall from
+76.3 s to 0.8 s and prefetch hit rate from 66% to 99.5%. Depth stops helping
+above 8.
+
+**Then the bottleneck moves.** With stall gone, per-block cost dominates:
+128-row blocks had the *best* stall (17.2 s → 0.6 s) and the *worst* decode,
+because 456k reads a run cost more in futures, host→device copies and kernel
+launches than they saved in waiting. Optimum is where the two curves cross —
+512 rows here. A microbenchmark on one isolated matrix picked 128 and was
+wrong about the full model; it measured I/O in isolation and never saw the
+per-block overhead accumulate.
+
 **More I/O threads is not more throughput.** Measured with 5.85 MB random
 reads (one expert slab) on the 50 GB shard: 1 worker 0.62 GB/s, **8 workers
 2.00 GB/s**, 24 workers 1.57, 48 workers 1.37. A DRAM-less controller thrashes
@@ -190,7 +281,8 @@ neurostream/
   format/    gguf.py  sharded.py  tokenizer.py     container, multi-shard, BPE
   io/        reader.py  arena.py  stream.py  source.py   async I/O, budget
   residency/ cache.py  planner.py                   VRAM/RAM/disk placement
-  compute/   quant.py  triton_kernels.py  blockffn.py  ops.py
+  compute/   quant.py  triton_kernels.py  ops.py    dequant, fused GEMV
+             blockffn.py                            stream_linear, BlockPrefetcher
   moe/       router.py                               selective expert fetch
   vision/    tower.py  prompt.py                     ViT, mRoPE, DeepStack
   model/     qwen3.py  gpt_oss.py                    Qwen3 / Qwen3-VL / MoE
@@ -201,16 +293,52 @@ Supported: Qwen3, Qwen3-VL, Qwen3-VL-MoE, GPT-OSS. Quantization: Q4_K, Q5_K,
 Q6_K, Q8_0, Q4_0, MXFP4, F32, F16, BF16 — Q4_K, Q6_K and MXFP4 bit-exact
 against the reference `gguf` implementation, and fused in Triton for decode.
 
+## GPT-OSS-120B
+
 GPT-OSS adds biased projections and experts, YaRN, attention sinks,
 alternating sliding/full attention, and a clamped SwiGLU. GPT-OSS-120B is
 36 layers of 128 experts with 4 active, 63.4 GB on disk of which 96.4% is
-expert weights, so a token reads about 4.2 GB — 6.6% of the file:
+expert weights, so a token reads about 4.2 GB — 6.6% of the file, of which
+~1.9 GB is experts and the rest is served from VRAM:
 
 ```bash
 python download_gpt_oss.py                  # 63 GB, resumable, SHA-256 checked
-python run_gpt_oss.py -p "Hello" --final-only
-python run_gpt_oss.py --chat --block-rows 1024 --expert-lookahead 4
+python run_gpt_oss.py -p "Hello"
+python run_gpt_oss.py -p "Hello" --reasoning low --final-only
+python run_gpt_oss.py --chat --slab-budget 4GB
 ```
+
+GPT-OSS replies in **harmony** format: an `analysis` chain of thought first,
+then the `final` answer. Two consequences for the runner:
+
+- `--max-tokens` has to cover both. The default is 512; a low cap returns
+  reasoning and no answer, and the runner says so explicitly rather than
+  printing a truncated thought and stopping. `--reasoning low` shortens the
+  thinking, which is usually the cheaper way to reach the answer.
+- `--final-only` hides the chain of thought. `HarmonyStream` in
+  `run_gpt_oss.py` splits the channels out of the token stream, including
+  when a channel marker is split across two tokens.
+
+Measured on the RTX 5050 Laptop (8.5 GB VRAM, 15.7 GB RAM, DRAM-less NVMe),
+warmed and pinned at `--slab-budget 4GB`:
+
+| Setting | I/O stall | Prefetch hit | Decode |
+|---|---:|---:|---:|
+| 1024 rows, per-projection pipeline | 76.3 s | 66.3% | 0.44 tok/s |
+| 256 rows, shared prefetch | 0.6 s | 99.8% | 0.51 tok/s |
+| **512 rows, shared prefetch** | **0.8 s** | **99.5%** | **0.73 tok/s** |
+
+The shared layer-wide prefetch plan is what removed the stall: a
+per-projection pipeline drains 12 times per layer — 432 times per token — and
+each drain costs an unhidden disk latency, which held effective queue depth at
+3 and throughput at the drive's queue-depth-1 rate.
+
+**These decode figures are a warm best case.** They come from 16-token runs
+taken immediately after warmup, while the pinned experts still match the
+routing warmup exercised. A ~450-token generation on the same prompt sustained
+about **0.46 tok/s**, roughly 63% of the short-run number, as routing drifts
+off the pinned set. Treat the rankings as sound and the absolute rates as
+optimistic.
 
 ## Tests
 
@@ -227,10 +355,10 @@ python tests/test_tuning.py         # block sizing, slab reuse, pinning
 The tokenizer is validated against HuggingFace on 314 cases including 300
 fuzzed strings: zero encode mismatches, zero round-trip failures.
 
-## Two bugs worth knowing about
+## Bugs worth knowing about
 
-Both were found by testing, and both are the kind that produce plausible-looking
-garbage rather than an exception:
+Found by testing, and mostly the kind that produce plausible-looking garbage
+or plausible-looking *numbers* rather than an exception:
 
 - **`id()`-keyed memoization.** A row-geometry cache keyed by `id(tensor_info)`
   silently hands one model's strides to the next model loaded in the same
@@ -240,3 +368,21 @@ garbage rather than an exception:
   arena bytes released only by `raw_bytes()`, but the block path consumes via
   `fetch_rows()` and never calls it, so the arena starves. Whole-tensor
   prefetch is now disabled whenever block streaming is active.
+- **The pipeline holds `depth + 1` blocks, not `depth`.** The block currently
+  being multiplied still owns its arena lease — it is only released after its
+  output exists. Sizing the budget for `depth` blocks deadlocked on the refill
+  that follows the first wait. Caught by `test_tuning.py`, which runs
+  `stream_linear` against deliberately tiny budgets.
+- **A pinned expert is not a resident tensor.** Slabs are cached per row
+  range, so `is_resident(name)` is false for the stacked expert tensor even
+  when the planner pinned the exact rows being asked for. The async path
+  checked only residency and would have re-read pinned experts from disk —
+  silently correct, and silently pointless. `TieredCache._slab_for` now
+  resolves sub-ranges against enclosing slabs.
+- **Counters that were never incremented.** `RouterStats.expert_hits` was
+  defined and printed as `(N cached)` but nothing ever set it, so it read zero
+  regardless of caching and briefly sent tuning in the wrong direction.
+  `MIN_READ` and `rows_for_min_read` are likewise documented as widening small
+  reads but are called from nowhere — so there is currently **no floor on read
+  size**, which is part of why 128-row blocks were free to fall off the
+  drive's efficiency cliff. A dead counter is worse than a missing one.
