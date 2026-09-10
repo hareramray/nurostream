@@ -1,2 +1,88 @@
-models
+# ---------------------------------------------------------------------------
+# Model weights and downloads
+#
+# This is the section that matters here. One GPT-OSS-120B GGUF is 63 GB, and
+# the downloader preallocates the .part file to its full size on the first
+# chunk -- so a download that is 1% done still costs 63 GB if it is committed.
+# The patterns cover weights that land outside models/ as well, because a
+# stray *.gguf in the repo root is the expensive mistake, not the expected one.
+# ---------------------------------------------------------------------------
+models/
+*.gguf
+*.gguf.part
+*.part
+*.progress.json
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Hub and dataset caches
+.cache/
+.huggingface/
+hf_cache/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------------------------------------------------------------------------
+# GPU kernel and compiler caches
+#
+# Triton JIT-compiles the fused dequant kernels on first use and caches the
+# generated cubins; none of it is portable between machines.
+# ---------------------------------------------------------------------------
+.triton/
+.nv/
+*.cubin
+*.ptx
+*.fatbin
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Local scratch and run output
+#
+# tests/tuning_results.json is deliberately tracked: it is the measured
+# tuning table the runners cite, not a transient artifact.
+# ---------------------------------------------------------------------------
+*.log
+scratch/
+tmp/
+bench_*.json
+!tests/tuning_results.json

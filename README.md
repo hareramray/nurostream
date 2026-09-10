@@ -30,13 +30,66 @@ tokens/sec  =  effective_bandwidth  /  active_bytes_per_token
 Literal one-parameter-at-a-time I/O is impossible — an SSD's minimum transfer
 is a 4 KB page at ~80 µs. The library separates the two granularities:
 
-- **Execution granularity: one neuron.** Every projection is computed in
-  row-blocks; peak working memory is O(block), never O(layer).
-- **I/O granularity: one block.** Rows are fetched in contiguous 256 KB–4 MB
-  runs, prefetched ahead of the compute cursor.
+- **Streamed projections use blocks of output neurons.** The default 235B
+  runner requests up to 4,096 rows per block and keeps the next blocks in
+  flight. Blocks shrink when necessary to fit the pipeline — `lookahead + 1`
+  raw I/O buffers — inside the arena.
+- **Resident projections can use a whole-matrix fused kernel.** Frequently
+  used weights stay cached in RAM or VRAM instead of being read again.
+- **MoE routing picks which neurons to read.** The router names the active
+  experts, and each one is then walked in neuron blocks like any other
+  projection: expert `e` owns rows `[e*out, (e+1)*out)`, so `--block-rows`
+  splits it the same way. Peak weight memory follows the block, not the
+  expert: one GPT-OSS 120B expert matrix is 2,880 MXFP4 rows = 4.41 MB, and
+  streaming it 128 rows at a time measured a 0.39 MB arena peak — the same
+  output, bit for bit, in 11× less memory. Setting `--block-rows 0` restores
+  the older whole-expert reads.
 
-The public API is neuron-at-a-time. The bytes leaving the disk are large and
-sequential. Both are true at once, and that is the whole trick.
+This is block streaming, not literal one-neuron-at-a-time loading. The
+streaming arena bounds its raw I/O reservations; resident caches, expanded
+weights, activations, and the KV cache also require memory.
+
+## Tuning blocks and caching
+
+The cache planner prioritizes small frequently used tensors and full output
+projections over untied input embedding tables, whose decode access only
+needs one row. Quantized expert slabs are reused during both prompt prefill
+and decode. Warmup in `run_235b.py` uses the same chat formatting as generation
+to make expert selection more representative of the actual request.
+
+Use the repeatable benchmark to compare block sizes and expert cache budgets:
+
+```bash
+python tests/bench_tuning.py --rows 1024,4096,8192 --repeats 2 --output models/_tuning/blocks.json
+python tests/bench_tuning.py --slab-budget 3.5GB --output models/_tuning/cache-3.5GB.json
+python tests/test_tuning.py
+```
+
+Run one GPU workload at a time. The benchmark replays identical tokens and
+records decode time, read bytes, and predictions, excluding model loading,
+warmup, pinning, and prefill. It does not clear the OS file cache. Short-run
+timings and hot-expert cache benefits depend on the prompt; repeat runs before
+treating small differences as improvements. A larger expert cache also leaves
+less VRAM for ordinary projections, so increasing it can cause extra reads.
+
+On the RTX 5050 Laptop GPU, the September 11 tuning run measured the following
+with the 235B model, a 1 GB I/O budget, 7 GB VRAM budget (including 1.5 GB
+reserved for working memory), 2 GB RAM cache, and 8 I/O workers:
+
+| Code | Block rows | Expert cache | Decode tok/s | GB read/token |
+|---|---:|---:|---:|---:|
+| Original (`0c7f17a`) | 4096 | 3.5 GB | 0.101 | 6.150 |
+| Revised | 1024 | 3.5 GB | 0.120 | 5.702 |
+| Revised | 4096 | 3.5 GB | 0.114 | 5.705 |
+| Revised | 8192 | 3.5 GB | 0.119 | 5.705 |
+| Revised, runner defaults | 4096 | 3 GB | 0.124 | 5.899 |
+
+These are single trials of three fixed decode tokens after warmup on
+"The capital of France is", not sustained chat benchmarks. All predicted
+tokens matched. The selected defaults were about 23% faster than the original
+in this test; block-size differences alone were inconclusive. Cache budget
+strings use binary GB (GiB); read-volume figures above use decimal GB.
+Raw measurements and settings are in [tests/tuning_results.json](tests/tuning_results.json).
 
 ## Measured hardware (the design targets these numbers)
 
@@ -140,13 +193,24 @@ neurostream/
   compute/   quant.py  triton_kernels.py  blockffn.py  ops.py
   moe/       router.py                               selective expert fetch
   vision/    tower.py  prompt.py                     ViT, mRoPE, DeepStack
-  model/     qwen3.py                                Qwen3 / Qwen3-VL / MoE
+  model/     qwen3.py  gpt_oss.py                    Qwen3 / Qwen3-VL / MoE
   api.py  cli.py
 ```
 
-Supported: Qwen3, Qwen3-VL, Qwen3-VL-MoE. Quantization: Q4_K, Q5_K, Q6_K,
-Q8_0, Q4_0, F32, F16, BF16 — Q4_K and Q6_K bit-exact against the reference
-`gguf` implementation, and fused in Triton for decode.
+Supported: Qwen3, Qwen3-VL, Qwen3-VL-MoE, GPT-OSS. Quantization: Q4_K, Q5_K,
+Q6_K, Q8_0, Q4_0, MXFP4, F32, F16, BF16 — Q4_K, Q6_K and MXFP4 bit-exact
+against the reference `gguf` implementation, and fused in Triton for decode.
+
+GPT-OSS adds biased projections and experts, YaRN, attention sinks,
+alternating sliding/full attention, and a clamped SwiGLU. GPT-OSS-120B is
+36 layers of 128 experts with 4 active, 63.4 GB on disk of which 96.4% is
+expert weights, so a token reads about 4.2 GB — 6.6% of the file:
+
+```bash
+python download_gpt_oss.py                  # 63 GB, resumable, SHA-256 checked
+python run_gpt_oss.py -p "Hello" --final-only
+python run_gpt_oss.py --chat --block-rows 1024 --expert-lookahead 4
+```
 
 ## Tests
 
@@ -156,6 +220,8 @@ python tests/test_p1_streaming.py   # budget independence
 python tests/test_p2_neuron.py      # O(block) peak memory
 python tests/test_p6_sharded.py     # splits a model into 3 real shards
 python tests/test_p3_p4_p5.py       # CUDA, MoE, vision (skips absent models)
+python tests/test_gpt_oss.py        # vs Transformers; neuron-block experts
+python tests/test_tuning.py         # block sizing, slab reuse, pinning
 ```
 
 The tokenizer is validated against HuggingFace on 314 cases including 300

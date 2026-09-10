@@ -143,6 +143,37 @@ if HAVE_TRITON:
         tl.store(y_ptr + rows, acc, mask=rmask)
 
 
+if HAVE_TRITON:
+    @triton.jit
+    def quant32_gemv_kernel(x_ptr, w_ptr, h_ptr, y_ptr, N, K, row_bytes,
+                            BLOCK_N: tl.constexpr, MX: tl.constexpr):
+        rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        j = tl.arange(0, 256)
+        acc = tl.full((BLOCK_N,), 0, tl.float32)
+        for base in range(tl.cdiv(K, 256)):
+            col = base * 256 + j
+            mask = (rows[:, None] < N) & (col[None, :] < K)
+            if MX:
+                off = rows[:, None] * row_bytes + (col[None, :] // 32) * 17
+                e = tl.load(w_ptr + off, mask=mask, other=0).to(tl.int32)
+                bits = tl.where(e < 2, 0x00200000 << e, (e - 1) << 23)
+                scale = bits.to(tl.float32, bitcast=True)
+                packed = tl.load(w_ptr + off + 1 + col[None, :] % 16, mask=mask, other=0).to(tl.int32)
+                code = (packed >> tl.where(col[None, :] % 32 < 16, 0, 4)) & 15
+                mag = code & 7
+                value = tl.where(mag < 4, mag, tl.where(mag == 4, 4,
+                        tl.where(mag == 5, 6, tl.where(mag == 6, 8, 12)))).to(tl.float32)
+                weight = scale * tl.where(code < 8, value, -value)
+            else:
+                off = rows[:, None] * row_bytes + (col[None, :] // 32) * 34
+                scale = tl.load(h_ptr + off // 2, mask=mask, other=0).to(tl.float32)
+                q = tl.load(w_ptr + off + 2 + col[None, :] % 32, mask=mask, other=0).to(tl.int32)
+                weight = scale * tl.where(q < 128, q, q - 256).to(tl.float32)
+            xv = tl.load(x_ptr + col, mask=col < K, other=0).to(tl.float32)
+            acc += tl.sum(weight * xv[None, :], axis=1)
+        tl.store(y_ptr + rows, acc, mask=rows < N)
+
+
 _KERNELS = {}
 if HAVE_TRITON:
     from ..format.gguf import GGMLType
@@ -150,6 +181,8 @@ if HAVE_TRITON:
     _KERNELS = {
         GGMLType.Q4_K: (q4k_gemv_kernel, 144),
         GGMLType.Q6_K: (q6k_gemv_kernel, 210),
+        GGMLType.Q8_0: (quant32_gemv_kernel, 34),
+        GGMLType.MXFP4: (quant32_gemv_kernel, 17),
     }
 
 
@@ -179,15 +212,17 @@ def fused_gemv(
     """
     kernel, block_bytes = _KERNELS[dtype]
     # Row stride, not block size. Each row spans K/256 quantization blocks.
-    row_bytes = (K // 256) * block_bytes
+    from ..format.gguf import TYPE_LAYOUT
+    row_bytes = (K // TYPE_LAYOUT[dtype][0]) * block_bytes
     # x stays fp16; the kernel widens after load. Converting here would
     # mean an extra alloc + kernel launch on every one of ~250 calls a token.
     xf = x.reshape(-1).contiguous()
     y = torch.empty(n_rows, device=x.device, dtype=torch.float32)
-    hview = raw.view(torch.float16)
+    hview = raw if dtype == GGMLType.MXFP4 else raw.view(torch.float16)
     grid = (triton.cdiv(n_rows, block_n),)
+    extra = {'MX': dtype == GGMLType.MXFP4} if dtype in (GGMLType.MXFP4, GGMLType.Q8_0) else {}
     kernel[grid](
         xf, raw, hview, y, n_rows, K, row_bytes,
-        BLOCK_N=block_n, num_warps=num_warps,
+        BLOCK_N=block_n, num_warps=num_warps, **extra,
     )
     return y.reshape(1, n_rows).to(out_dtype)

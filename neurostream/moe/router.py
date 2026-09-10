@@ -20,13 +20,13 @@ import torch
 import torch.nn.functional as F
 
 from ..compute import triton_kernels as tk
+from ..io.arena import BudgetExceeded
 
 
 @dataclass
 class RouterStats:
     tokens_routed: int = 0
     expert_reads: int = 0
-    expert_hits: int = 0  # served from cache/RAM instead of disk
     hits: Counter = field(default_factory=Counter)
 
     def top_experts(self, layer: int, k: int = 8) -> list[tuple[int, int]]:
@@ -51,8 +51,8 @@ class RouterStats:
     def summary(self) -> str:
         return (
             f"routed {self.tokens_routed} tokens | "
-            f"{self.expert_reads} expert reads "
-            f"({self.expert_hits} cached) | top-20% skew {self.skew():.1%}"
+            f"{self.expert_reads} expert reads | "
+            f"top-20% skew {self.skew():.1%}"
         )
 
 
@@ -103,8 +103,8 @@ def submit_expert_reads(model, layer: int, experts) -> dict:
                 continue
             try:
                 # submit_rows already returns (future, nbytes)
-                pending[(name, lo)] = src.submit_rows(name, lo, hi)
-            except Exception:
+                pending[(name, lo)] = src.submit_rows(name, lo, hi, timeout=0)
+            except (BudgetExceeded, TimeoutError):
                 return pending  # budget full; the rest resolve synchronously
     return pending
 
@@ -148,12 +148,22 @@ def _expert_matmul(model, name: str, expert: int, rows_per_expert: int, x,
         return x @ w.T
 
     hit = model.cache.raw_rows(name, lo, hi)
-    if hit is not None and tk.can_fuse(hit[1], x):
+    if hit is not None:
         row_elems = model.gguf.tensors[name].torch_shape[-1]
-        return tk.fused_gemv(
-            hit[0], hit[1], x, rows_per_expert, row_elems,
+        if tk.can_fuse(hit[1], x):
+            return tk.fused_gemv(
+                hit[0], hit[1], x, rows_per_expert, row_elems,
+                out_dtype=model.dtype,
+            )
+        # Batched prefill cannot use GEMV, but can still reuse the cached
+        # bytes. fetch_rows here used to discard this hit and reread disk.
+        from ..compute.quant import dequantize
+
+        w = dequantize(
+            hit[0], hit[1], rows_per_expert * row_elems,
             out_dtype=model.dtype,
-        )
+        ).reshape(rows_per_expert, row_elems)
+        return x @ w.T
     w = model.cache.fetch_rows(
         name, lo, hi, device=model.device, dtype=model.dtype
     )

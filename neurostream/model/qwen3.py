@@ -170,8 +170,11 @@ class Qwen3Model:
             from ..compute import triton_kernels as tk
             from ..io.source import row_geometry
 
-            hit = self.cache.raw_quantized(name)
-            if hit is not None and tk.can_fuse(hit[1], x):
+            hit = (
+                self.cache.raw_quantized(name)
+                if tk.can_fuse(self.gguf.tensors[name].dtype, x) else None
+            )
+            if hit is not None:
                 n_rows, row_elems, _ = row_geometry(self.gguf.tensors[name])
                 return tk.fused_gemv(
                     hit[0], hit[1], x, n_rows, row_elems, out_dtype=self.dtype

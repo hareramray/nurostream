@@ -1,0 +1,127 @@
+{
+  "date": "2026-09-11",
+  "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU",
+  "torch": "2.11.0+cu128",
+  "model": "Qwen3-VL-235B-A22B-Instruct-Q4_K_M (3 shards)",
+  "baseline_commit": "0c7f17a",
+  "prompt": "The capital of France is",
+  "forced_continuation": " Paris, which is also the most populous city in France.",
+  "measured_decode_tokens": 3,
+  "warmup_tokens": 3,
+  "common_settings": {
+    "mem_budget": "1GB",
+    "vram_budget": "7GB",
+    "ram_budget": "2GB",
+    "reserve_vram": "1.5GB",
+    "n_workers": 8
+  },
+  "selected_defaults": {
+    "block_rows": 4096,
+    "slab_budget": "3GB"
+  },
+  "limitations": [
+    "One trial per configuration; short teacher-forced decode rather than sustained generation.",
+    "GPU workloads ran sequentially. OS file cache was not flushed.",
+    "Load, warmup, pinning, and prefill are excluded from decode time and read volume.",
+    "Arena peak includes model loading; it is not total process RAM or VRAM.",
+    "Expert routing and cache benefits depend on the prompt."
+  ],
+  "trials": [
+    {
+      "implementation": "original",
+      "repeat": 0,
+      "block_rows": 4096,
+      "slab_budget": "3.5GB",
+      "seconds": 29.604349999994156,
+      "tokens_per_second": 0.10133645900013316,
+      "bytes_per_token": 6149695488.0,
+      "predictions": [
+        12095,
+        11,
+        892,
+        374
+      ],
+      "arena_peak": 403881984,
+      "vram_weights": 2147483648,
+      "ram_weights": 2147483648,
+      "expert_cache_bytes": 3757473792
+    },
+    {
+      "implementation": "revised",
+      "repeat": 0,
+      "block_rows": 1024,
+      "slab_budget": "3.5GB",
+      "seconds": 24.993407200003276,
+      "tokens_per_second": 0.12003165378746787,
+      "bytes_per_token": 5701634304.0,
+      "predictions": [
+        12095,
+        11,
+        892,
+        374
+      ],
+      "arena_peak": 510504960,
+      "vram_weights": 2146372608,
+      "ram_weights": 2147254272,
+      "expert_cache_bytes": 3757473792
+    },
+    {
+      "implementation": "revised",
+      "repeat": 0,
+      "block_rows": 4096,
+      "slab_budget": "3.5GB",
+      "seconds": 26.297213400001056,
+      "tokens_per_second": 0.11408052839544891,
+      "bytes_per_token": 5705173248.0,
+      "predictions": [
+        12095,
+        11,
+        892,
+        374
+      ],
+      "arena_peak": 510504960,
+      "vram_weights": 2146372608,
+      "ram_weights": 2147254272,
+      "expert_cache_bytes": 3757473792
+    },
+    {
+      "implementation": "revised",
+      "repeat": 0,
+      "block_rows": 8192,
+      "slab_budget": "3.5GB",
+      "seconds": 25.211294300010195,
+      "tokens_per_second": 0.11899428741343068,
+      "bytes_per_token": 5705173248.0,
+      "predictions": [
+        12095,
+        11,
+        892,
+        374
+      ],
+      "arena_peak": 510504960,
+      "vram_weights": 2146372608,
+      "ram_weights": 2147254272,
+      "expert_cache_bytes": 3757473792
+    },
+    {
+      "implementation": "revised",
+      "repeat": 0,
+      "block_rows": 4096,
+      "slab_budget": "3GB",
+      "prefill_seconds": 32.019069899994065,
+      "seconds": 24.101558499998646,
+      "tokens_per_second": 0.12447327835667427,
+      "bytes_per_token": 5899272192.0,
+      "predictions": [
+        12095,
+        11,
+        892,
+        374
+      ],
+      "arena_peak": 510504960,
+      "vram_weights": 2683456512,
+      "ram_weights": 2072297472,
+      "expert_cache_bytes": 3217784832
+    }
+  ]
+}

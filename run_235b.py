@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Run Qwen3-VL-235B-A22B on this laptop.
 
-142 GB of weights, 8 GB of VRAM. Expect roughly 9-10 seconds per token, so
+142 GB of weights, 8 GB of VRAM. Expect roughly 8-10 seconds per token, so
 tokens are streamed as they arrive rather than made you wait for the whole
 reply.
 
@@ -10,7 +10,7 @@ reply.
     python run_235b.py --chat
     python run_235b.py -p "Hi" --no-warmup      # skip the 90s pin step
 
-The defaults are the tuned ones from the P6 benchmark. Two of them matter and
+The defaults use the local block/cache tuning results. Two settings matter and
 are easy to get wrong:
 
   --workers 8     Queue depth. Measured on this drive with 5.85 MB random
@@ -18,9 +18,10 @@ are easy to get wrong:
                   48 workers 1.37. More threads is not more throughput.
   --slab-budget   VRAM held for hot MoE expert slabs. Warmup measures which
                   experts this prompt actually routes to and pins those;
-                  without it, ~3.5 GB of VRAM sits idle. Measured: 0.105 tok/s
-                  with warmup+pin vs 0.048 without - it pays for its own 90s
-                  after roughly 8 tokens. Note the pinning is tuned to the
+                  without it, the reserved expert VRAM sits idle. The latest
+                  short fixed-token comparison selected 3 GB (0.124 tok/s)
+                  over 3.5 GB (0.114 tok/s), both with 4096-row blocks.
+                  See tests/tuning_results.json. Note the pinning is tuned to the
                   warmup prompt; a very different follow-up prompt keeps less
                   of the benefit.
 """
@@ -34,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-DEFAULT_DIR = ROOT / "models" / "Qwen3-VL-235B-A22B-Instruct-GGUF"
+DEFAULT_DIR = ROOT / "models" / "gpt-oss-120b-GGUF"
 
 
 def find_model(explicit: str | None) -> tuple[Path, Path | None]:
@@ -109,13 +110,16 @@ def main(argv=None) -> int:
     ap.add_argument("--mem-budget", default="1GB")
     ap.add_argument("--vram-budget", default="7GB")
     ap.add_argument("--ram-budget", default="2GB")
-    ap.add_argument("--slab-budget", default="3.5GB")
+    ap.add_argument("--slab-budget", default="3GB",
+                    help="VRAM for hot expert weights (default 3GB)")
     ap.add_argument("--reserve-vram", default="1.5GB")
-    ap.add_argument("--block-rows", type=int, default=4096)
+    ap.add_argument("--block-rows", type=int, default=4096,
+                    help="maximum rows per streamed projection block; "
+                         "shrinks to fit two I/O buffers")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--no-warmup", action="store_true",
-                    help="skip warmup+pin: saves ~90s but roughly halves "
-                         "throughput (0.048 vs 0.105 tok/s measured)")
+                    help="skip warmup+pin for faster startup; uncached "
+                         "experts require more disk reads")
     ap.add_argument("--warmup-tokens", type=int, default=3)
     a = ap.parse_args(argv)
 
@@ -164,7 +168,10 @@ def main(argv=None) -> int:
         print(f"warmup  : {a.warmup_tokens} tokens to learn expert routing "
               f"(~90s) ...", flush=True)
         t0 = time.perf_counter()
-        ns.warmup(prompt=a.prompt, tokens=a.warmup_tokens)
+        warmup_prompt = a.prompt if a.raw else ns.tokenizer.apply_chat_template(
+            [{"role": "user", "content": a.prompt}]
+        )
+        ns.warmup(prompt=warmup_prompt, tokens=a.warmup_tokens)
         n = ns.pin_hot_experts()
         print(f"          pinned {n} experts "
               f"({ns.cache.slab_bytes / 1e9:.2f} GB) in "
@@ -196,7 +203,7 @@ def main(argv=None) -> int:
                     label="\n235b > ",
                 )
         else:
-            rate = 0.048 if a.no_warmup else 0.105
+            rate = 0.048 if a.no_warmup else 0.12
             est = human_eta(a.max_tokens, rate)
             print(f"\ngenerating up to {a.max_tokens} tokens "
                   f"(~{est} at {rate} tok/s, plus ~40-80s prefill)\n")

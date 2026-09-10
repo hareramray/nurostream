@@ -26,7 +26,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--reserve-vram", default="1.5GB",
                    help="VRAM left free for activations and KV cache")
     p.add_argument("--block-rows", type=int, default=4096,
-                   help="neurons per streamed block")
+                   help="maximum rows per streamed block; shrinks to fit the I/O budget")
     p.add_argument("--workers", type=int, default=16,
                    help="NVMe queue depth")
     p.add_argument("--device", default=None, choices=[None, "cpu", "cuda"])
@@ -43,7 +43,11 @@ def cmd_info(a) -> int:
     if len(shards) > 1:
         for s in shards:
             print(f"  shard {s.name}  {s.stat().st_size / 1e9:.1f}GB")
-    cfg = Qwen3Config.from_gguf(g)
+    if g.arch() == 'gpt-oss':
+        from .model.gpt_oss import GptOssConfig
+        cfg = GptOssConfig.from_gguf(g)
+    else:
+        cfg = Qwen3Config.from_gguf(g)
     print(f"  {cfg}")
 
     from collections import Counter
@@ -81,7 +85,7 @@ def cmd_run(a) -> int:
 
     if a.warmup and ns.cfg.is_moe:
         print("  warming up to learn expert routing ...", flush=True)
-        ns.warmup(tokens=a.warmup)
+        ns.warmup(prompt=a.prompt, tokens=a.warmup)
         ns.pin_hot_experts(verbose=True)
         print(flush=True)
 

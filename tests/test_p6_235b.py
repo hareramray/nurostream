@@ -21,8 +21,8 @@ sys.path.insert(0, str(ROOT))
 from neurostream.api import NeuroStream
 from neurostream.format.sharded import ShardedGGUF, discover_shards
 
-DIR = ROOT / "models" / "Qwen3-VL-235B-A22B-Instruct-GGUF"
-SHARD1 = DIR / "Q4_K_M" / "Qwen3-VL-235B-A22B-Instruct-Q4_K_M-00001-of-00003.gguf"
+DIR = ROOT / "models" / "gpt-oss-120b-GGUF"
+SHARD1 = DIR / "Q4_K_M" / "gpt-oss-120b-Q4_K_M-00001-of-00003.gguf"
 MMPROJ = DIR / "mmproj-F16.gguf"
 
 PROMPT = "The capital of France is"

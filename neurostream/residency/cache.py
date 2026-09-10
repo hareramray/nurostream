@@ -99,6 +99,9 @@ class TieredCache:
         # caching the hot slabs across every layer is what the measured
         # routing skew actually rewards.
         self._slab: OrderedDict[str, _Entry] = OrderedDict()
+        # Row spans per tensor, so a request for part of a slab can find the
+        # slab that encloses it instead of only an exact-key match.
+        self._slab_spans: dict[str, list[tuple[int, int]]] = {}
         self.slab_bytes = 0
         self.slab_budget = 0
         self._vram: OrderedDict[str, _Entry] = OrderedDict()
@@ -138,11 +141,15 @@ class TieredCache:
                 return  # everything left is pinned
 
     def admit_vram(self, name: str) -> bool:
+        if name in self._vram:
+            return True
         info = self.gguf.tensors[name]
         need = self.vram_cost(name)
         if need > self.vram_budget:
             return False
         self._evict(self._vram, need, self.vram_budget, True)
+        if self.stats.vram_bytes + need > self.vram_budget:
+            return False
 
         if info.dtype in _FLOAT_TYPES:
             t = self.source.fetch(
@@ -160,11 +167,15 @@ class TieredCache:
         return True
 
     def admit_ram(self, name: str) -> bool:
+        if name in self._ram:
+            return True
         info = self.gguf.tensors[name]
         need = info.nbytes
         if need > self.ram_budget:
             return False
         self._evict(self._ram, need, self.ram_budget, False)
+        if self.stats.ram_bytes + need > self.ram_budget:
+            return False
         self._ram[name] = _Entry(
             payload=self.source.raw_bytes(name), nbytes=need, ready=False,
             dtype=info.dtype, n_elements=info.n_elements,
@@ -208,6 +219,24 @@ class TieredCache:
             name, device=self.device, dtype=self.compute_dtype
         )
 
+    def _slab_for(self, name: str, start: int, end: int):
+        """(entry, slab_start) for a cached slab covering rows [start, end).
+
+        Neuron-block streaming asks for sub-ranges of the very slabs the
+        planner pinned, so matching only exact keys would miss every one of
+        them and re-read the block from disk — the opposite of what pinning
+        is for. Spans per tensor are few (one per pinned expert), so the scan
+        is cheaper than the read it avoids.
+        """
+        for lo, hi in self._slab_spans.get(name, ()):
+            if lo <= start and end <= hi:
+                key = f"{name}#{lo}:{hi}"
+                entry = self._slab.get(key)
+                if entry is not None:
+                    self._slab.move_to_end(key)
+                    return entry, lo
+        return None
+
     def fetch_rows(
         self, name: str, start: int, end: int,
         device: torch.device | str | None = None,
@@ -225,6 +254,21 @@ class TieredCache:
         dtype = self.compute_dtype if dtype is None else dtype
 
         from ..io.source import row_geometry
+
+        found = self._slab_for(name, start, end)
+        if found is not None:
+            slab, base = found
+            _, row_elems, row_bytes = row_geometry(self.gguf.tensors[name])
+            self.stats.vram_hits += 1
+            self.stats.slab_hits += 1
+            self.stats.dequant_calls += 1
+            raw = slab.payload[
+                (start - base) * row_bytes : (end - base) * row_bytes
+            ]
+            return dequantize(
+                raw.to(device), slab.dtype,
+                (end - start) * row_elems, out_dtype=dtype,
+            ).reshape(end - start, row_elems)
 
         e = self._vram.get(name) or self._ram.get(name)
         if e is None:
@@ -302,11 +346,12 @@ class TieredCache:
         self._slab[key] = _Entry(
             payload=raw, nbytes=need, ready=False, dtype=info.dtype,
         )
+        self._slab_spans.setdefault(name, []).append((start, end))
         self.slab_bytes += need
         return True
 
     def has_slab(self, name: str, start: int, end: int) -> bool:
-        return f"{name}#{start}:{end}" in self._slab
+        return self._slab_for(name, start, end) is not None
 
     def raw_rows(self, name: str, start: int, end: int):
         """(raw_bytes_on_device, ggml_dtype) for a row range, or None.
@@ -319,17 +364,21 @@ class TieredCache:
         info = self.gguf.tensors[name]
         if info.dtype in _FLOAT_TYPES:
             return None
-        skey = f"{name}#{start}:{end}"
-        slab = self._slab.get(skey)
-        if slab is not None:
-            self._slab.move_to_end(skey)
+        _, _, row_bytes = row_geometry(info)
+        found = self._slab_for(name, start, end)
+        if found is not None:
+            slab, base = found
             self.stats.vram_hits += 1
             self.stats.slab_hits += 1
-            return slab.payload, slab.dtype
+            return (
+                slab.payload[
+                    (start - base) * row_bytes : (end - base) * row_bytes
+                ],
+                slab.dtype,
+            )
         if self._slab:
             self.stats.slab_misses += 1
 
-        _, _, row_bytes = row_geometry(info)
         lo, hi = start * row_bytes, end * row_bytes
 
         e = self._vram.get(name)
@@ -361,6 +410,7 @@ class TieredCache:
         first one's corpse.
         """
         self._slab.clear()
+        self._slab_spans.clear()
         self._vram.clear()
         self._ram.clear()
         self.slab_bytes = 0

@@ -126,7 +126,22 @@ def dequant_q4_0(buf: torch.Tensor) -> torch.Tensor:
     return (d * q).reshape(nb, 32)
 
 
+def dequant_mxfp4(buf: torch.Tensor) -> torch.Tensor:
+    """MXFP4: one E8M0 exponent and 16 packed E2M1 bytes per 32 values."""
+    exponent = buf[:, :1].to(torch.int32)
+    bits = torch.where(exponent < 2, 0x00200000 << exponent,
+                       (exponent - 1) << 23)
+    scale = bits.contiguous().view(torch.float32)
+    packed = buf[:, 1:]
+    codes = torch.cat((packed & 15, packed >> 4), dim=1).long()
+    values = torch.tensor((0, 1, 2, 3, 4, 6, 8, 12,
+                           0, -1, -2, -3, -4, -6, -8, -12),
+                          device=buf.device, dtype=torch.float32)
+    return scale * values[codes]
+
+
 _KERNELS = {
+    GGMLType.MXFP4: dequant_mxfp4,
     GGMLType.Q4_K: dequant_q4_k,
     GGMLType.Q5_K: dequant_q5_k,
     GGMLType.Q6_K: dequant_q6_k,

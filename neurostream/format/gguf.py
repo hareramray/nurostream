@@ -32,6 +32,7 @@ class GGMLType(IntEnum):
     Q6_K = 14
     Q8_K = 15
     BF16 = 30
+    MXFP4 = 39
 
 
 # (elements per block, bytes per block)
@@ -39,6 +40,7 @@ TYPE_LAYOUT: dict[GGMLType, tuple[int, int]] = {
     GGMLType.F32: (1, 4),
     GGMLType.F16: (1, 2),
     GGMLType.BF16: (1, 2),
+    GGMLType.MXFP4: (32, 17),
     GGMLType.Q4_0: (32, 18),
     GGMLType.Q4_1: (32, 20),
     GGMLType.Q5_0: (32, 22),

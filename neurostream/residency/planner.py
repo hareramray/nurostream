@@ -26,6 +26,9 @@ from ..format.gguf import GGMLType
 BW_VRAM = 350.0
 BW_RAM = 18.2
 BW_DISK = 2.35
+# Approximate per-request cost; otherwise tiny, always-used norms lose to
+# large matrices despite saving hundreds of small reads on every token.
+READ_LATENCY = 80e-6
 
 
 @dataclass
@@ -66,7 +69,7 @@ def access_frequency(name: str, cfg) -> float:
 
 
 def is_expert_tensor(name: str) -> bool:
-    return ".ffn_" in name and "_exps" in name
+    return ".ffn_" in name and "_exps" in name and name.endswith('.weight')
 
 
 def plan(
@@ -76,6 +79,7 @@ def plan(
     ram_budget: int = 0,
     reserve_vram: int = 0,
     slab_budget: int = 0,
+    float_itemsize: int = 2,
 ) -> Placement:
     """Greedy benefit-density placement over all tensors in the file.
 
@@ -91,11 +95,22 @@ def plan(
         if slab_budget and is_expert_tensor(name):
             continue
         f = access_frequency(name, cfg)
+        if name == "token_embd.weight" and "output.weight" in gguf.tensors:
+            # Decode gathers one row. A tied embedding is also the output
+            # projection, however, and still needs the entire matrix.
+            f = 1 / max(1, info.torch_shape[0])
         b = info.nbytes
-        # seconds saved per token by promoting out of disk
-        gain_vram = f * b * (1 / BW_DISK - 1 / BW_VRAM) / 1e9
-        gain_ram = f * b * (1 / BW_DISK - 1 / BW_RAM) / 1e9
-        scored.append((gain_vram / b, gain_ram / b, name, b, f))
+        vram_cost = (
+            info.n_elements * float_itemsize
+            if info.dtype in (GGMLType.F32, GGMLType.F16, GGMLType.BF16)
+            else b
+        )
+        # Compute density directly to avoid floating-point multiply/divide
+        # noise arbitrarily reordering equally hot tensors.
+        latency_density = READ_LATENCY / b if b <= 64 * 1024 else 0.0
+        gain_vram = f * ((1 / BW_DISK - 1 / BW_VRAM) / 1e9 + latency_density)
+        gain_ram = f * ((1 / BW_DISK - 1 / BW_RAM) / 1e9 + latency_density)
+        scored.append((gain_vram * (b / vram_cost), gain_ram, name, b, vram_cost))
 
     # Benefit density is size-independent for equally-hot tensors, so the sort
     # would otherwise be arbitrary and whichever tensors happened to land last
@@ -104,22 +119,16 @@ def plan(
     # VRAM first, by density
     p = Placement()
     taken: set[str] = set()
-    for _, _, name, b, _f in sorted(scored, key=lambda r: (-r[0], -r[3])):
+    for _, _, name, b, vram_cost in sorted(scored, key=lambda r: (-r[0], -r[3])):
         # VRAM keeps quantized tensors quantized — see cache.py. Only tensors
         # already stored as float cost more than their on-disk size.
-        info = gguf.tensors[name]
-        vram_cost = (
-            info.n_elements * 2
-            if info.dtype in (GGMLType.F32, GGMLType.F16, GGMLType.BF16)
-            else info.nbytes
-        )
         if p.vram_bytes + vram_cost <= vram_budget:
             p.vram.append(name)
             p.vram_bytes += vram_cost
             taken.add(name)
 
     # RAM next, still quantized, so cost is the on-disk size
-    for _, _, name, b, _f in sorted(scored, key=lambda r: (-r[1], -r[3])):
+    for _, _, name, b, _cost in sorted(scored, key=lambda r: (-r[1], -r[3])):
         if name in taken:
             continue
         if p.ram_bytes + b <= ram_budget:

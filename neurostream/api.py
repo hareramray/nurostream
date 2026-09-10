@@ -17,7 +17,7 @@ from typing import Iterator
 
 import torch
 
-from .compute.blockffn import DEFAULT_BLOCK_ROWS
+from .compute.blockffn import DEFAULT_BLOCK_ROWS, DEFAULT_LOOKAHEAD
 from .format.tokenizer import GGUFTokenizer
 from .io.arena import Arena
 from .io.stream import StreamingSource
@@ -75,8 +75,10 @@ class NeuroStream:
         reserve_vram: int | str = "1.5GB",
         slab_budget: int | str = 0,
         strict_neuron: bool = False,
+        expert_lookahead: int = DEFAULT_LOOKAHEAD,
         verbose: bool = False,
     ) -> None:
+        automatic_dtype = compute_dtype is None
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if compute_dtype is None:
@@ -89,7 +91,18 @@ class NeuroStream:
         self.arena = Arena(parse_size(mem_budget))
         self.source = StreamingSource(path, self.arena, n_workers=n_workers)
         self.gguf = self.source.gguf
-        self.cfg = Qwen3Config.from_gguf(self.gguf)
+        if self.gguf.arch() == 'gpt-oss':
+            from .model.gpt_oss import GptOssConfig, GptOssModel
+            config_cls, model_cls = GptOssConfig, GptOssModel
+            if automatic_dtype and str(device).startswith('cuda'):
+                compute_dtype = torch.bfloat16
+                self.dtype = compute_dtype
+        elif self.gguf.arch() in ('qwen3', 'qwen3moe', 'qwen3vl', 'qwen3vlmoe'):
+            config_cls, model_cls = Qwen3Config, Qwen3Model
+        else:
+            self.source.close()
+            raise ValueError(f'unsupported architecture: {self.gguf.arch()}')
+        self.cfg = config_cls.from_gguf(self.gguf)
         self.tokenizer = GGUFTokenizer(self.gguf)
 
         vram_budget = parse_size(vram_budget)
@@ -105,6 +118,7 @@ class NeuroStream:
                 self.gguf, self.cfg, vram_budget, ram_budget,
                 reserve_vram=parse_size(reserve_vram),
                 slab_budget=self.cache.slab_budget,
+                float_itemsize=compute_dtype.itemsize,
             )
             if verbose:
                 print(f"  placement: {self.placement.summary()}", flush=True)
@@ -115,10 +129,14 @@ class NeuroStream:
         else:
             self.placement = None
 
-        self.model = Qwen3Model(
+        extra = (
+            {'expert_lookahead': expert_lookahead}
+            if model_cls is not Qwen3Model else {}
+        )
+        self.model = model_cls(
             self.cache, self.cfg, device=device, dtype=compute_dtype,
             block_rows=block_rows, prefetch_depth=prefetch_depth,
-            strict_neuron=strict_neuron,
+            strict_neuron=strict_neuron, **extra,
         )
         self.stats = GenerationStats()
 
@@ -188,6 +206,8 @@ class NeuroStream:
     # -- vision -----------------------------------------------------------
 
     def attach_vision(self, mmproj_path) -> None:
+        if self.gguf.arch() == 'gpt-oss':
+            raise ValueError('GPT-OSS is a text-only model')
         from .vision.tower import VisionTower
 
         self.tower = VisionTower(
@@ -284,8 +304,12 @@ class NeuroStream:
             return 0
         cfg = self.cfg
         pinned = 0
+        from .format.gguf import GGMLType
+        from .io.source import row_geometry
+
         for (layer, e), _count in rs.hits.most_common():
-            ok = True
+            slabs = []
+            need = 0
             for nm, rpe in (
                 ("ffn_gate_exps.weight", cfg.n_ffn_expert),
                 ("ffn_up_exps.weight", cfg.n_ffn_expert),
@@ -294,9 +318,21 @@ class NeuroStream:
                 name = f"blk.{layer}.{nm}"
                 if name not in self.gguf.tensors:
                     continue
-                ok &= self.cache.admit_slab(name, e * rpe, (e + 1) * rpe)
-            if not ok:
-                break  # slab budget exhausted
+                lo, hi = e * rpe, (e + 1) * rpe
+                if self.cache.is_resident(name) or self.cache.has_slab(name, lo, hi):
+                    continue
+                info = self.gguf.tensors[name]
+                if info.dtype in (GGMLType.F32, GGMLType.F16, GGMLType.BF16):
+                    continue
+                need += rpe * row_geometry(info)[2]
+                slabs.append((name, lo, hi))
+            if not slabs or need > self.cache.slab_budget - self.cache.slab_bytes:
+                continue
+            # Reserve room for all three matrices before reading any of them.
+            # A partial final expert used to consume space and terminate the
+            # search even if a smaller complete expert would still fit.
+            for name, lo, hi in slabs:
+                self.cache.admit_slab(name, lo, hi)
             pinned += 1
         if verbose:
             print(f"  pinned {pinned} expert slabs "
@@ -327,8 +363,9 @@ class NeuroStream:
             lines.append(f"router   : {rs.summary()}")
         if self.cache.slab_bytes:
             lines.append(
-                f"slabs    : {len(self.cache._slab)} experts, "
-                f"{self.cache.slab_bytes / 1e9:.2f}GB"
+                f"slabs    : {len(self.cache._slab)} slabs, "
+                f"{self.cache.slab_bytes / 1e9:.2f}GB | "
+                f"{self.cache.stats.slab_hits} block reads served from VRAM"
             )
         return "\n".join(lines)
 

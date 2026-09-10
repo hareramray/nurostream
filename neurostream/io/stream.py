@@ -197,16 +197,22 @@ class StreamingSource:
         finally:
             self.arena.release(nbytes)
 
-    def submit_rows(self, name: str, start: int, end: int) -> tuple[Future, int]:
+    def submit_rows(
+        self, name: str, start: int, end: int, *, timeout: float | None = None,
+    ) -> tuple[Future, int]:
         """Async variant of fetch_rows; caller must release the arena bytes."""
         info = self.gguf.tensors[name]
         n_rows, _, row_bytes = row_geometry(info)
         start, end = max(0, start), min(n_rows, end)
         nbytes = (end - start) * row_bytes
-        self.arena.acquire(nbytes)
-        fut = self._reader_for(name).submit(
-            self.gguf.file_offset(info) + start * row_bytes, nbytes
-        )
+        self.arena.acquire(nbytes, timeout=timeout)
+        try:
+            fut = self._reader_for(name).submit(
+                self.gguf.file_offset(info) + start * row_bytes, nbytes
+            )
+        except Exception:
+            self.arena.release(nbytes)
+            raise
         return fut, nbytes
 
     def close(self) -> None:
