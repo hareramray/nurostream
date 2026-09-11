@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neurostream"
+dynamic = ["version"]
+description = "Run transformers larger than memory: weights stream from NVMe at neuron granularity under a hard memory ceiling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hareram", email = "hareramray325@gmail.com" }]
+keywords = [
+    "llm", "inference", "gguf", "moe", "quantization", "streaming",
+    "nvme", "transformers", "triton", "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.1",
+    "regex>=2023.0.0",
+]
+
+[project.optional-dependencies]
+vision = ["pillow>=9.0"]
+chat = ["jinja2>=3.0"]
+triton = ["triton>=2.2; sys_platform == 'linux'"]
+all = ["pillow>=9.0", "jinja2>=3.0", "triton>=2.2; sys_platform == 'linux'"]
+
+[project.urls]
+Homepage = "https://github.com/hareramray/nurostream"
+Repository = "https://github.com/hareramray/nurostream"
+Issues = "https://github.com/hareramray/nurostream/issues"
+
+[project.scripts]
+neurostream = "neurostream.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "neurostream.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["neurostream*"]
+exclude = ["tests*", "models*"]

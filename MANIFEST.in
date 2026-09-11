@@ -1,0 +1,11 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Never ship model weights, caches, or build scratch. One GGUF here is 63 GB.
+prune models
+prune tests
+prune .git
+global-exclude *.gguf *.gguf.part *.part *.progress.json *.safetensors *.bin
+global-exclude *.pyc *.pyo *.so *.pyd
+global-exclude __pycache__/*

@@ -164,7 +164,7 @@ These are single trials of three fixed decode tokens after warmup on
 tokens matched. The selected defaults were about 23% faster than the original
 in this test; block-size differences alone were inconclusive. Cache budget
 strings use binary GB (GiB); read-volume figures above use decimal GB.
-Raw measurements and settings are in [tests/tuning_results.json](tests/tuning_results.json).
+Raw measurements and settings are in [tests/tuning_results.json](https://github.com/hareramray/nurostream/blob/main/tests/tuning_results.json).
 
 ## Measured hardware (the design targets these numbers)
 
