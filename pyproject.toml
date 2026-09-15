@@ -12,8 +12,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Hareram", email = "hareramray325@gmail.com" }]
 keywords = [
-    "llm", "inference", "gguf", "moe", "quantization", "streaming",
-    "nvme", "transformers", "triton", "pytorch",
+    "llm", "inference", "gguf", "safetensors", "moe", "quantization",
+    "streaming", "nvme", "transformers", "triton", "pytorch",
+    "multimodal", "vision", "qwen", "gemma",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
