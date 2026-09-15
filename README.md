@@ -289,9 +289,306 @@ neurostream/
   api.py  cli.py
 ```
 
-Supported: Qwen3, Qwen3-VL, Qwen3-VL-MoE, GPT-OSS. Quantization: Q4_K, Q5_K,
+Supported: Qwen3, Qwen3-VL, Qwen3-VL-MoE, GPT-OSS, Gemma 4 E4B (text/chat),
+Qwen3.5-4B (text/chat/images, GGUF or safetensors). Quantization: Q4_K, Q5_K,
 Q6_K, Q8_0, Q4_0, MXFP4, F32, F16, BF16 — Q4_K, Q6_K and MXFP4 bit-exact
 against the reference `gguf` implementation, and fused in Triton for decode.
+Weights come from a GGUF file or, for Qwen3.5, straight from a HuggingFace
+safetensors checkpoint.
+
+## Qwen3.5-4B
+
+[Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) is a hybrid-attention
+model: three Gated DeltaNet layers for every one gated full-attention layer,
+32 layers over a 2560-wide residual stream. The recurrent layers hold a
+fixed-size state instead of a growing KV history, so memory per token stops
+growing on three quarters of the layers.
+
+Three weight formats load: the **original safetensors checkpoint** from the
+Hugging Face repo, an unquantized **BF16 GGUF**, and quantized GGUF. The format
+is detected from the path; no flag is needed.
+
+### From the Hugging Face checkpoint
+
+Point at the repo directory and the original BF16 safetensors (about 9.33 GB,
+vision tower included) are read directly — no GGUF conversion step:
+
+```bash
+python -m pip install -e ".[chat]" huggingface_hub
+python -m huggingface_hub.cli.hf download Qwen/Qwen3.5-4B --local-dir models/Qwen3.5-4B
+python -m neurostream info models/Qwen3.5-4B
+python run_qwen35.py --model models/Qwen3.5-4B -p "Explain gravity simply."
+python run_qwen35.py --model models/Qwen3.5-4B --image photo.jpg -p "What is in this picture?"
+```
+
+The checkpoint holds the text model, the vision tower and the tokenizer in one
+directory, so `attach_vision()` takes no argument there and no `mmproj` file is
+needed. Sharded checkpoints load through `model.safetensors.index.json`; a
+single `.safetensors` file or the index itself is also accepted.
+
+Nothing is read at open time beyond one header per shard, so opening the
+checkpoint costs the same as opening a GGUF, and weights still stream by neuron
+block under `--mem-budget`. The engine speaks llama.cpp's tensor dialect
+internally, so the checkpoint is translated at the index: tensors are renamed,
+RMSNorm weights gain the `+1` that HF applies at runtime, `A_log` becomes
+`-exp(A_log)`, and linear-attention value heads are retiled. Every one of those
+transforms is row-local, which is what lets block streaming survive the
+translation. The MTP block in the repo is skipped, since it is a speculative
+decoding head rather than model depth.
+
+Only float checkpoints load this way (F32/F16/BF16); a quantized checkpoint
+should be loaded as GGUF instead.
+
+### Unquantized BF16 GGUF
+
+The BF16 conversion of the text model is about **8.42 GB**:
+
+```bash
+python -m pip install -e ".[chat]" huggingface_hub
+python -m huggingface_hub.cli.hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-BF16.gguf --local-dir models/qwen35
+python -m neurostream run models/qwen35/Qwen3.5-4B-BF16.gguf --chat --no-thinking -p "Explain gravity simply." --mem-budget 512MB --vram-budget 6GB
+```
+
+The download command invokes the Hugging Face CLI through Python, so it also
+works on Windows when `hf` is not on PATH. Add `--dry-run` to check the download
+without fetching the weights.
+
+BF16 weights remain floating point. Weights that do not fit the cache stream
+from disk, so the entire 8.42 GB file does not need to fit in VRAM. CPU
+inference expands BF16 blocks to float32 for computation; CUDA defaults to
+bfloat16. The recurrent state and the delta-rule update stay in float32 at both
+precisions, because a decayed running state compounds rounding error in a way
+attention does not.
+
+### Quantized
+
+Any quantized GGUF from the same repository loads the same way, for example
+`Qwen3.5-4B-Q4_K_M.gguf` (about 2.74 GB):
+
+```bash
+python -m huggingface_hub.cli.hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q4_K_M.gguf --local-dir models/qwen35
+python -m neurostream info models/qwen35/Qwen3.5-4B-Q4_K_M.gguf
+python -m neurostream run models/qwen35/Qwen3.5-4B-Q4_K_M.gguf --chat --no-thinking -p "Explain gravity simply." --mem-budget 512MB --vram-budget 6GB
+```
+
+### Python API and options
+
+Use the dedicated launcher to run the downloaded BF16 model with the default
+memory settings, or pass `--model` to select a quantized file:
+
+```bash
+python run_qwen35.py -p "Explain gravity simply."
+python run_qwen35.py --chat
+python run_qwen35.py --model models/qwen35/Qwen3.5-4B-Q4_K_M.gguf -p "Hello"
+python run_qwen35.py --device cpu --ram-budget 2GB -p "Hello"
+```
+
+The launcher applies chat formatting automatically and disables thinking by
+default. `--chat` keeps conversation history; use `/reset` to clear it and
+`/quit` to exit. Add `--thinking -n 1024` to enable thinking output. Run
+`python run_qwen35.py --help` for memory and sampling options.
+
+Use `--device cpu` with `--vram-budget 0` to stream on CPU. Both files use the
+same Python API; for example, with unquantized weights:
+
+```python
+from neurostream import NeuroStream
+
+with NeuroStream.load("models/qwen35/Qwen3.5-4B-BF16.gguf",
+                      mem_budget="512MB", vram_budget="6GB") as ns:
+    for piece in ns.chat("Explain gravity simply.", enable_thinking=False, max_tokens=128):
+        print(piece, end="", flush=True)
+```
+
+`--chat` applies the GGUF's chat template; without it, `run` completes a raw
+prompt. `--thinking` enables the template's thinking mode; allow more output
+tokens for that mode. Generation stops at `<|im_end|>` and buffers split UTF-8
+bytes correctly.
+
+The native text path implements the gated delta rule with its causal depthwise
+convolution, L2-normalized queries and keys, per-head decay, gated attention
+with a per-head output gate, partial (quarter-width) RoPE, and the interval-4
+recurrent/full layer pattern. Weights are read with llama.cpp's conventions:
+RMSNorm weights arrive pre-shifted by one, `A_log` arrives already negated and
+exponentiated, and linear-attention value heads arrive tiled by key head rather
+than grouped. A Qwen3.5 GGUF also reports one more block than the model has
+layers, because the converter counts the multi-token-prediction block; the
+extra block is metadata, not depth, and is excluded.
+
+The sparse MoE variants of the family are not supported; loading one reports
+an unsupported architecture rather than producing wrong output.
+
+### Images
+
+The vision tower ships as a separate `mmproj` file (about **0.68 GB** in BF16).
+Download it alongside the text model and pass an image:
+
+```bash
+python -m huggingface_hub.cli.hf download unsloth/Qwen3.5-4B-GGUF mmproj-BF16.gguf --local-dir models/qwen35
+python run_qwen35.py --image photo.jpg -p "What is in this picture?"
+python -m neurostream run models/qwen35/Qwen3.5-4B-BF16.gguf --image photo.jpg --mmproj models/qwen35/mmproj-BF16.gguf -p "What is in this picture?" --no-thinking
+```
+
+Both entry points fall back to an `mmproj-*.gguf` sitting beside the model, so
+`--mmproj` is only needed when it lives elsewhere. `--max-patches` caps how many
+tokens an image may become, so a large photo cannot fill the context on its own.
+
+```python
+with NeuroStream.load("models/qwen35/Qwen3.5-4B-BF16.gguf", vram_budget="6GB") as ns:
+    ns.attach_vision("models/qwen35/mmproj-BF16.gguf")
+    for piece in ns.generate_vl("photo.jpg", "What is in this picture?",
+                                enable_thinking=False, max_tokens=128):
+        print(piece, end="", flush=True)
+```
+
+The whole image is encoded in one batched pass, so a 400-token image costs
+about as much weight traffic as a single text token — the asymmetry that makes
+vision affordable on a streaming engine.
+
+Three things have to agree for an image to mean anything, and each is checked
+against Transformers rather than assumed. The tower resamples its learned 48x48
+position grid **bilinearly with align_corners=True**, where Qwen3-VL uses
+bicubic — corner alignment moves every patch's sample point. Its patch merger
+uses exact GELU while the encoder MLP uses the tanh approximation. And the
+merged patches enter the text model with real **interleaved M-RoPE** positions:
+each image token carries its own (frame, row, column), and Qwen3.5 scatters the
+three axes across neighbouring frequency dims instead of giving each axis one
+contiguous band, so text after an image resumes past the wider of the two image
+axes. Only the full-attention layers read those positions; the recurrent layers
+have no rotary embedding at all.
+
+llama.cpp converts the Qwen3-VL and Qwen3.5 towers with the same code, so the
+`mmproj` tensor layout is shared, including the Conv3d patch embedding split
+into two Conv2d kernels along the temporal axis. A still image is fed as two
+identical frames, which is what that split expects.
+
+Video input is not supported: Qwen3.5 separates frames with timestamp tokens
+and gives each frame its own temporal position, and neither is implemented.
+The 4B ships an empty `deepstack_visual_indexes`, so there are no DeepStack
+taps to inject; a tower that produced them is rejected rather than ignored.
+
+Validation uses tiny models against Transformers for prefill, incremental and
+chunked decode, recurrent state and convolution history carried across chunks,
+tied/untied output weights, Q8_0/Q4_0 projections, BF16 storage, RAM/VRAM cache
+loading, MTP block counting, and CPU/CUDA execution. The image tests cover the
+tower against the reference vision model, the interleaved M-RoPE tables, the
+position ids against `get_rope_index`, and multimodal prefill and decode. Full
+4B weights are not needed by any of them:
+
+```bash
+python -m pip install gguf "transformers>=5.17" jinja2 pillow safetensors
+python tests/test_qwen35.py
+python tests/test_qwen35_vision.py
+python tests/test_qwen35_safetensors.py
+```
+
+The safetensors tests write their checkpoint with the reference `safetensors`
+writer, so the index parser is checked against an independent producer, and
+they assert the three translation fixups directly — a checkpoint that skipped
+any of them would load happily and answer wrongly.
+
+Full-model generation and throughput have not been benchmarked.
+
+## Gemma 4 E4B
+
+[Gemma 4 E4B](https://huggingface.co/google/gemma-4-E4B-it) is Google's
+effective-4B model. Its per-layer embedding tables add parameters beyond the
+effective count. The engine reads only the requested rows of those tables.
+
+Both unquantized **BF16 GGUF** and quantized GGUF weights are supported.
+The storage format is detected from the file; no precision flag is needed.
+GGUF is a container and can hold floating-point weights without quantization.
+
+### Unquantized BF16
+
+The [llama.cpp BF16 conversion](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)
+of Gemma 4 E4B IT is about **15.1 GB**. Download only the text model file:
+
+```bash
+python -m pip install -e ".[chat]" huggingface_hub
+python -m huggingface_hub.cli.hf download ggml-org/gemma-4-E4B-it-GGUF gemma-4-E4B-it-BF16.gguf --local-dir models/gemma4
+python -m neurostream run models/gemma4/gemma-4-E4B-it-BF16.gguf --chat --no-thinking -p "Explain gravity simply." --mem-budget 512MB --vram-budget 6GB
+```
+
+The download command invokes the Hugging Face CLI through Python, so it also
+works on Windows when `hf` is not on PATH. Add `--dry-run` to check the download
+without fetching the weights.
+
+BF16 weights remain floating point. Weights that do not fit the cache stream
+from disk, so the entire 15.1 GB file does not need to fit in VRAM. Cache loading
+also reads large tensors in bounded chunks: the 1.34 GB token embedding can be
+loaded into VRAM with a 512 MB I/O budget. CPU inference expands BF16 blocks to
+float32 for computation; CUDA defaults to bfloat16.
+
+### Quantized Q4_0
+
+Download Google's [Q4_0 GGUF](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf)
+(about 5.15 GB) and run a chat prompt:
+
+```bash
+python -m pip install -e ".[chat]" huggingface_hub
+python -m huggingface_hub.cli.hf download google/gemma-4-E4B-it-qat-q4_0-gguf gemma-4-E4B_q4_0-it.gguf --local-dir models/gemma4
+python -m neurostream info models/gemma4/gemma-4-E4B_q4_0-it.gguf
+python -m neurostream run models/gemma4/gemma-4-E4B_q4_0-it.gguf --chat --no-thinking -p "Explain gravity simply." --mem-budget 512MB --vram-budget 6GB
+```
+
+### Python API and options
+
+Use the dedicated launcher to run the downloaded BF16 model with the default
+memory settings, or pass `--model` to select a quantized file:
+
+```bash
+python run_gemmamodel.py -p "Explain gravity simply."
+python run_gemmamodel.py --chat
+python run_gemmamodel.py --model models/gemma4/gemma-4-E4B_q4_0-it.gguf -p "Hello"
+python run_gemmamodel.py --device cpu --ram-budget 2GB -p "Hello"
+```
+
+The launcher applies chat formatting automatically and disables thinking by
+default. `--chat` keeps conversation history; use `/reset` to clear it and
+`/quit` to exit. Add `--thinking -n 1024` to enable thinking output. Run
+`python run_gemmamodel.py --help` for memory and sampling options.
+
+Use `--device cpu` with `--vram-budget 0` to stream on CPU. Both files use the
+same Python API; for example, with unquantized weights:
+
+```python
+from neurostream import NeuroStream
+
+with NeuroStream.load("models/gemma4/gemma-4-E4B-it-BF16.gguf",
+                      mem_budget="512MB", vram_budget="6GB") as ns:
+    for piece in ns.chat("Explain gravity simply.", enable_thinking=False, max_tokens=128):
+        print(piece, end="", flush=True)
+```
+
+`--chat` applies the GGUF's chat template; without it, `run` completes a raw
+prompt. `--thinking` enables the template's thinking mode; allow more output
+tokens for that mode. Generation stops at Gemma's end-of-turn token and buffers
+split UTF-8 bytes correctly. CUDA defaults to bfloat16; CPU uses float32.
+
+The native text path implements local/global attention with different head
+dimensions, proportional RoPE, shared KV layers, per-layer embeddings, GELU
+gating, and logit softcapping. Sliding KV history is cropped after shared layers
+consume it. The I/O budget bounds streaming buffers; activations, tokenizer,
+resident weights, and global KV history need additional memory. The advertised
+128K context is a model limit, not a guarantee it fits the available memory.
+
+Gemma image/audio input and the 26B/31B architectures are not supported by this
+implementation. The Qwen vision projector cannot be attached to Gemma.
+
+Validation uses tiny models against Transformers for prefill, incremental and
+chunked decode, shared caches, tied/untied output weights, Q8_0/Q4_0 projections,
+BF16 storage with tensors larger than the I/O budget, RAM/VRAM cache loading,
+and CPU/CUDA execution. Full E4B weights are not needed by these tests:
+
+```bash
+python -m pip install gguf "transformers>=5.5" jinja2
+python tests/test_gemma4.py
+```
+
+For full-vocabulary tokenizer parity, set `NEUROSTREAM_GEMMA4_TOKENIZER_DIR` to a
+directory with Google's `tokenizer.json` and `chat_template.jinja` before running
+the tests. Full-model generation and throughput have not been benchmarked.
 
 ## GPT-OSS-120B
 
@@ -349,6 +646,10 @@ python tests/test_p2_neuron.py      # O(block) peak memory
 python tests/test_p6_sharded.py     # splits a model into 3 real shards
 python tests/test_p3_p4_p5.py       # CUDA, MoE, vision (skips absent models)
 python tests/test_gpt_oss.py        # vs Transformers; neuron-block experts
+python tests/test_gemma4.py         # vs Transformers; Gemma text/chat and shared KV
+python tests/test_qwen35.py         # vs Transformers; Qwen3.5 hybrid recurrent/full layers
+python tests/test_qwen35_vision.py  # vs Transformers; Qwen3.5 tower, M-RoPE, image splice
+python tests/test_qwen35_safetensors.py  # vs Transformers; HF checkpoint read without GGUF
 python tests/test_tuning.py         # block sizing, slab reuse, pinning
 ```
 

@@ -48,6 +48,7 @@ def mrope_tables(
     sections,
     device,
     dtype: torch.dtype = torch.float32,
+    interleaved: bool = False,
 ):
     """Multimodal RoPE: different frequency bands index different axes.
 
@@ -55,9 +56,14 @@ def mrope_tables(
     splits head_dim/2 into sections - [24, 20, 20] for head_dim 128 - and
     each section reads one axis.
 
-    For pure text every axis carries the same position, so this reduces
-    exactly to 1-D RoPE. That is why the text path was already correct
-    without it.
+    Qwen3.5 uses the same section sizes but interleaves them: frequency dim j
+    reads axis j % 3 rather than sitting in one contiguous band, with each
+    axis cut off after its section's worth of dims. Every axis therefore
+    spans the whole frequency range instead of owning one end of it.
+
+    For pure text every axis carries the same position, so either layout
+    reduces exactly to 1-D RoPE. That is why the text path was already
+    correct without it.
     """
     half = head_dim // 2
     inv = 1.0 / (
@@ -65,12 +71,19 @@ def mrope_tables(
     )
     # Map each of the `half` frequency dims to an axis via the section sizes.
     axis = torch.zeros(half, dtype=torch.long, device=device)
-    cut = 0
-    for a, n in enumerate(s for s in sections if s > 0):
-        axis[cut : cut + n] = a
-        cut += n
-    if cut < half:
-        axis[cut:] = 0
+    if interleaved:
+        # Height takes dims 1, 4, 7, ... and width 2, 5, 8, ...; whatever is
+        # left over stays with the temporal axis.
+        for a, offset in ((1, 1), (2, 2)):
+            n = sections[a] if a < len(sections) else 0
+            axis[offset : min(n * 3, half) : 3] = a
+    else:
+        cut = 0
+        for a, n in enumerate(s for s in sections if s > 0):
+            axis[cut : cut + n] = a
+            cut += n
+        if cut < half:
+            axis[cut:] = 0
 
     pos = pos_ids.to(device, torch.float32)          # (3, T)
     sel = pos[axis]                                   # (half, T)

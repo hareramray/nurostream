@@ -14,13 +14,15 @@ VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
-def build_prompt(tokenizer, n_image_tokens: int, question: str) -> str:
+def build_prompt(tokenizer, n_image_tokens: int, question: str,
+                 enable_thinking: bool | None = None) -> str:
     """ChatML with a run of image placeholders the tower will fill in."""
     body = (
         VISION_START + IMAGE_PAD * n_image_tokens + VISION_END + question
     )
+    extra = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": body}], add_generation_prompt=True
+        [{"role": "user", "content": body}], add_generation_prompt=True, **extra
     )
 
 

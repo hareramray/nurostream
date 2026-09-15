@@ -82,6 +82,10 @@ class KVCache:
     def __init__(self, n_layer: int) -> None:
         self.k: list[torch.Tensor | None] = [None] * n_layer
         self.v: list[torch.Tensor | None] = [None] * n_layer
+        # Hybrid Qwen3.5 layers keep convolution history and a fixed-size
+        # recurrent matrix instead of a growing key/value history.
+        self.conv: list[torch.Tensor | None] = [None] * n_layer
+        self.recurrent: list[torch.Tensor | None] = [None] * n_layer
         self.length = 0
 
     def append(
@@ -97,7 +101,7 @@ class KVCache:
     def nbytes(self) -> int:
         return sum(
             t.numel() * t.element_size()
-            for t in (*self.k, *self.v)
+            for t in (*self.k, *self.v, *self.conv, *self.recurrent)
             if t is not None
         )
 

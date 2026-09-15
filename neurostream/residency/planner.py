@@ -95,7 +95,9 @@ def plan(
         if slab_budget and is_expert_tensor(name):
             continue
         f = access_frequency(name, cfg)
-        if name == "token_embd.weight" and "output.weight" in gguf.tensors:
+        if name == 'per_layer_token_embd.weight' or (
+            name == "token_embd.weight" and "output.weight" in gguf.tensors
+        ):
             # Decode gathers one row. A tied embedding is also the output
             # projection, however, and still needs the entire matrix.
             f = 1 / max(1, info.torch_shape[0])

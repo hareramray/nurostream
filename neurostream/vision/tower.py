@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 from ..format.gguf import GGUFFile
+from ..format.safetensors import looks_like_safetensors
 from ..io.source import MmapSource
 from ..residency.cache import TieredCache
 
@@ -103,7 +105,14 @@ class VisionTower:
         dtype: torch.dtype = torch.float16,
         use_rope: bool = True,
     ) -> None:
-        self.source = MmapSource(mmproj_path)
+        # A safetensors checkpoint carries the tower inline; a GGUF build
+        # ships it as a separate mmproj file.
+        if looks_like_safetensors(mmproj_path):
+            from ..io.safetensors import SafetensorsSource
+
+            self.source = SafetensorsSource(mmproj_path, part="vision")
+        else:
+            self.source = MmapSource(mmproj_path)
         self.gguf = self.source.gguf
         self.cfg = VisionConfig.from_gguf(self.gguf)
         self.device = torch.device(device)
@@ -134,7 +143,7 @@ class VisionTower:
         """
         from PIL import Image
 
-        if isinstance(image, (str,)):
+        if isinstance(image, (str, Path)):
             image = Image.open(image)
         image = image.convert("RGB")
 
@@ -261,3 +270,43 @@ class VisionTower:
 
     def close(self) -> None:
         self.source.close()
+
+
+class Qwen35VisionTower(VisionTower):
+    """Qwen3.5 vision tower.
+
+    llama.cpp converts Qwen3-VL and Qwen3.5 mmproj files with one class, so
+    the tensor names and the encoder blocks are shared with `VisionTower`.
+    Two pieces of arithmetic are not:
+
+      position grid  Qwen3.5 resamples the learned 48x48 table bilinearly with
+                     align_corners=True, where Qwen3-VL uses bicubic with
+                     align_corners=False. Corner alignment moves every patch's
+                     sample point, so the wrong one skews the whole image.
+      merger GELU    the encoder MLP uses the tanh approximation, but the
+                     patch merger uses exact GELU.
+
+    The 4B ships an empty `deepstack_visual_indexes`, so no hidden states are
+    tapped; the merged patches enter the LLM at the embedding layer only.
+    """
+
+    def position_embed(self, x, gh: int, gw: int) -> torch.Tensor:
+        pe = self.w("v.position_embd.weight")
+        side = int(round(math.sqrt(pe.shape[0])))
+        if side * side != pe.shape[0]:
+            raise ValueError("Qwen3.5 position embedding table must be square")
+        if (gh, gw) == (side, side):
+            return x + pe
+        # Equivalent to the per-patch tap/weight gather in Transformers: with
+        # align_corners=True a patch at row r samples r*(side-1)/(gh-1).
+        grid = pe.reshape(1, side, side, -1).permute(0, 3, 1, 2).float()
+        grid = F.interpolate(
+            grid, size=(gh, gw), mode="bilinear", align_corners=True
+        )
+        pe = grid.permute(0, 2, 3, 1).reshape(gh * gw, -1).to(x.dtype)
+        return x + pe
+
+    def merger(self, x) -> torch.Tensor:
+        x = x @ self.w("mm.0.weight").T + self.w("mm.0.bias")
+        x = F.gelu(x)
+        return x @ self.w("mm.2.weight").T + self.w("mm.2.bias")

@@ -1,6 +1,7 @@
 """Command line entry point.
 
     python -m neurostream run model.gguf -p "Hello" --mem-budget 2GB
+    python -m neurostream run models/Qwen3.5-4B -p "Hello"     # safetensors directory
     python -m neurostream run model.gguf --image cat.png -p "What is this?"
     python -m neurostream info model.gguf
     python -m neurostream bench model.gguf
@@ -14,7 +15,8 @@ from pathlib import Path
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("model", help="path to a .gguf (any shard of a split set)")
+    p.add_argument("model", help="path to a .gguf (any shard of a split set), "
+                                 "or a HuggingFace safetensors checkpoint directory")
     p.add_argument("--mem-budget", default="1GB",
                    help="hard ceiling on streaming buffers (default 1GB)")
     p.add_argument("--vram-budget", default="0",
@@ -34,11 +36,16 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 
 def cmd_info(a) -> int:
     from .format.gguf import GGUFFile
+    from .format.safetensors import SafetensorsFile, looks_like_safetensors
     from .format.sharded import ShardedGGUF, discover_shards
     from .model.qwen3 import Qwen3Config
 
-    shards = discover_shards(a.model)
-    g = ShardedGGUF(a.model) if len(shards) > 1 else GGUFFile(a.model)
+    if looks_like_safetensors(a.model):
+        g = SafetensorsFile(a.model)
+        shards = g.paths
+    else:
+        shards = discover_shards(a.model)
+        g = ShardedGGUF(a.model) if len(shards) > 1 else GGUFFile(a.model)
     print(g)
     if len(shards) > 1:
         for s in shards:
@@ -46,6 +53,12 @@ def cmd_info(a) -> int:
     if g.arch() == 'gpt-oss':
         from .model.gpt_oss import GptOssConfig
         cfg = GptOssConfig.from_gguf(g)
+    elif g.arch() == 'qwen35':
+        from .model.qwen35 import Qwen35Config
+        cfg = Qwen35Config.from_gguf(g)
+    elif g.arch() == 'gemma4':
+        from .model.gemma4 import Gemma4Config
+        cfg = Gemma4Config.from_gguf(g)
     else:
         cfg = Qwen3Config.from_gguf(g)
     print(f"  {cfg}")
@@ -90,14 +103,22 @@ def cmd_run(a) -> int:
         print(flush=True)
 
     if a.image:
-        ns.attach_vision(a.mmproj or _guess_mmproj(a.model))
+        from .format.safetensors import looks_like_safetensors
+
+        # A safetensors checkpoint already contains its vision tower.
+        ns.attach_vision(a.mmproj or (
+            None if looks_like_safetensors(a.model) else _guess_mmproj(a.model)))
         stream = ns.generate_vl(
             a.image, a.prompt, max_tokens=a.max_tokens,
             temperature=a.temperature, max_patches=a.max_patches,
+            enable_thinking=a.thinking,
         )
     else:
-        stream = ns.generate(
-            a.prompt, max_tokens=a.max_tokens, temperature=a.temperature
+        generate = ns.chat if a.chat else ns.generate
+        chat_kw = {'enable_thinking': a.thinking} if a.chat and a.thinking is not None else {}
+        stream = generate(
+            a.prompt, max_tokens=a.max_tokens, temperature=a.temperature,
+            **chat_kw,
         )
 
     for piece in stream:
@@ -167,6 +188,9 @@ def main(argv=None) -> int:
     p.add_argument("-t", "--temperature", type=float, default=0.0)
     p.add_argument("--image", default=None)
     p.add_argument("--mmproj", default=None)
+    p.add_argument('--chat', action='store_true', help="format the prompt with the model's chat template")
+    p.add_argument('--thinking', action=argparse.BooleanOptionalAction, default=None,
+                   help='enable/disable thinking in the chat template (use with --chat or --image)')
     p.add_argument("--max-patches", type=int, default=1024)
     p.add_argument("--warmup", type=int, default=0,
                    help="tokens of warmup before pinning hot MoE experts")
@@ -180,6 +204,8 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_bench)
 
     a = ap.parse_args(argv)
+    if a.cmd == 'run' and a.thinking is not None and not (a.chat or a.image):
+        ap.error('--thinking/--no-thinking requires --chat or --image')
     return a.fn(a)
 
 

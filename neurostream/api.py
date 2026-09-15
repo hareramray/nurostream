@@ -9,6 +9,7 @@ this class makes: the model runs inside `mem_budget` no matter how big it is.
 """
 from __future__ import annotations
 
+import codecs
 import re
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import Iterator
 import torch
 
 from .compute.blockffn import DEFAULT_BLOCK_ROWS, DEFAULT_LOOKAHEAD
+from .format.safetensors import looks_like_safetensors
 from .format.tokenizer import GGUFTokenizer
 from .io.arena import Arena
 from .io.stream import StreamingSource
@@ -89,11 +91,30 @@ class NeuroStream:
         self.verbose = verbose
 
         self.arena = Arena(parse_size(mem_budget))
-        self.source = StreamingSource(path, self.arena, n_workers=n_workers)
+        if looks_like_safetensors(path):
+            # A HuggingFace checkpoint is translated into the engine's own
+            # tensor dialect at the index; see format/safetensors.py.
+            from .io.safetensors import SafetensorsSource
+
+            self.source = SafetensorsSource(path, arena=self.arena)
+        else:
+            self.source = StreamingSource(path, self.arena, n_workers=n_workers)
         self.gguf = self.source.gguf
         if self.gguf.arch() == 'gpt-oss':
             from .model.gpt_oss import GptOssConfig, GptOssModel
             config_cls, model_cls = GptOssConfig, GptOssModel
+            if automatic_dtype and str(device).startswith('cuda'):
+                compute_dtype = torch.bfloat16
+                self.dtype = compute_dtype
+        elif self.gguf.arch() == 'gemma4':
+            from .model.gemma4 import Gemma4Config, Gemma4Model
+            config_cls, model_cls = Gemma4Config, Gemma4Model
+            if automatic_dtype and str(device).startswith('cuda'):
+                compute_dtype = torch.bfloat16
+                self.dtype = compute_dtype
+        elif self.gguf.arch() == 'qwen35':
+            from .model.qwen35 import Qwen35Config, Qwen35Model
+            config_cls, model_cls = Qwen35Config, Qwen35Model
             if automatic_dtype and str(device).startswith('cuda'):
                 compute_dtype = torch.bfloat16
                 self.dtype = compute_dtype
@@ -102,8 +123,12 @@ class NeuroStream:
         else:
             self.source.close()
             raise ValueError(f'unsupported architecture: {self.gguf.arch()}')
-        self.cfg = config_cls.from_gguf(self.gguf)
-        self.tokenizer = GGUFTokenizer(self.gguf)
+        try:
+            self.cfg = config_cls.from_gguf(self.gguf)
+            self.tokenizer = GGUFTokenizer(self.gguf)
+        except Exception:
+            self.source.close()
+            raise
 
         vram_budget = parse_size(vram_budget)
         ram_budget = parse_size(ram_budget)
@@ -131,13 +156,18 @@ class NeuroStream:
 
         extra = (
             {'expert_lookahead': expert_lookahead}
-            if model_cls is not Qwen3Model else {}
+            if self.gguf.arch() == 'gpt-oss' else {}
         )
-        self.model = model_cls(
-            self.cache, self.cfg, device=device, dtype=compute_dtype,
-            block_rows=block_rows, prefetch_depth=prefetch_depth,
-            strict_neuron=strict_neuron, **extra,
-        )
+        try:
+            self.model = model_cls(
+                self.cache, self.cfg, device=device, dtype=compute_dtype,
+                block_rows=block_rows, prefetch_depth=prefetch_depth,
+                strict_neuron=strict_neuron, **extra,
+            )
+        except Exception:
+            self.cache.clear()
+            self.source.close()
+            raise
         self.stats = GenerationStats()
 
     @classmethod
@@ -181,12 +211,8 @@ class NeuroStream:
             logits = self.model.forward(torch.tensor(ids), kv, start_pos=0)
         self.stats.prefill_seconds = time.perf_counter() - t0
 
-        eos = {self.tokenizer.eos_id} if self.tokenizer.eos_id else set()
-        eos |= {
-            self.tokenizer.vocab[t]
-            for t in ("<|im_end|>", "<|endoftext|>")
-            if t in self.tokenizer.vocab
-        }
+        eos = self.tokenizer.stop_ids
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 
         pos = len(ids)
         t0 = time.perf_counter()
@@ -195,22 +221,40 @@ class NeuroStream:
             if stop_on_eos and nxt in eos:
                 break
             self.stats.generated_tokens += 1
-            yield self.tokenizer.decode([nxt])
+            piece = decoder.decode(self.tokenizer.decode_bytes([nxt]))
+            if piece:
+                yield piece
+            if self.stats.generated_tokens >= max_tokens:
+                break
             with torch.no_grad():
                 logits = self.model.forward(
                     torch.tensor([nxt]), kv, start_pos=pos
                 )
             pos += 1
+        tail = decoder.decode(b'', final=True)
+        if tail:
+            yield tail
         self.stats.decode_seconds = time.perf_counter() - t0
 
     # -- vision -----------------------------------------------------------
 
-    def attach_vision(self, mmproj_path) -> None:
+    def attach_vision(self, mmproj_path=None) -> None:
         if self.gguf.arch() == 'gpt-oss':
             raise ValueError('GPT-OSS is a text-only model')
-        from .vision.tower import VisionTower
+        if self.gguf.arch() == 'gemma4':
+            raise ValueError('Gemma 4 support currently accepts text input; its vision/audio towers are not implemented')
+        from .vision.tower import Qwen35VisionTower, VisionTower
 
-        self.tower = VisionTower(
+        tower_cls = (
+            Qwen35VisionTower if self.gguf.arch() == 'qwen35' else VisionTower
+        )
+        if mmproj_path is None:
+            # A safetensors checkpoint carries its vision tower inline, so
+            # there is no separate mmproj file to point at.
+            if not looks_like_safetensors(getattr(self.gguf, 'root', self.gguf.path)):
+                raise ValueError('this model needs an mmproj file: attach_vision(path)')
+            mmproj_path = self.gguf.root
+        self.tower = tower_cls(
             mmproj_path, device=self.device, dtype=self.dtype
         )
 
@@ -221,6 +265,7 @@ class NeuroStream:
         max_tokens: int = 64,
         temperature: float = 0.0,
         max_patches: int = 1024,
+        enable_thinking: bool | None = None,
     ) -> Iterator[str]:
         """Caption or answer about an image.
 
@@ -238,7 +283,8 @@ class NeuroStream:
         embeds, taps, gh, gw = tower.encode(image, max_patches=max_patches)
         n_img = embeds.shape[0]
 
-        text = build_prompt(self.tokenizer, n_img, question)
+        text = build_prompt(self.tokenizer, n_img, question,
+                            enable_thinking=enable_thinking)
         ids = self.tokenizer.encode(text)
         img_id = self.tokenizer.vocab[IMAGE_PAD]
         if sum(1 for i in ids if i == img_id) != n_img:
@@ -262,12 +308,8 @@ class NeuroStream:
             )
         self.stats.prefill_seconds = time.perf_counter() - t0
 
-        eos = {self.tokenizer.eos_id} if self.tokenizer.eos_id else set()
-        eos |= {
-            self.tokenizer.vocab[t]
-            for t in ("<|im_end|>", "<|endoftext|>")
-            if t in self.tokenizer.vocab
-        }
+        eos = self.tokenizer.stop_ids
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 
         t0 = time.perf_counter()
         for _ in range(max_tokens):
@@ -275,12 +317,18 @@ class NeuroStream:
             if nxt in eos:
                 break
             self.stats.generated_tokens += 1
-            yield self.tokenizer.decode([nxt])
+            piece = decoder.decode(self.tokenizer.decode_bytes([nxt]))
+            if piece:
+                yield piece
             pos = next_position(pos)
             with torch.no_grad():
                 logits = self.model.forward(
-                    torch.tensor([nxt]), kv, pos_ids=pos
+                    torch.tensor([nxt], device=self.device), kv,
+                    start_pos=kv.length, pos_ids=pos,
                 )
+        tail = decoder.decode(b'', final=True)
+        if tail:
+            yield tail
         self.stats.decode_seconds = time.perf_counter() - t0
 
     # -- expert residency -------------------------------------------------
@@ -339,9 +387,10 @@ class NeuroStream:
                   f"({self.cache.slab_bytes / 1e9:.2f}GB)", flush=True)
         return pinned
 
-    def chat(self, message: str, **kw) -> Iterator[str]:
+    def chat(self, message: str, *, enable_thinking: bool | None = None, **kw) -> Iterator[str]:
+        template_kw = {} if enable_thinking is None else {'enable_thinking': enable_thinking}
         text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": message}]
+            [{"role": "user", "content": message}], **template_kw
         )
         return self.generate(text, **kw)
 

@@ -140,6 +140,46 @@ class TieredCache:
             else:
                 return  # everything left is pinned
 
+    def _load_resident(self, name, device, dtype=None):
+        """Fill a cache allocation without requiring a tensor-sized I/O buffer.
+
+        In particular, Gemma E4B's BF16 token embedding is 1.34 GB, larger
+        than typical streaming arenas. The destination is charged to the
+        cache budget; only a bounded row block passes through the arena.
+        ``dtype=None`` retains the original bytes for RAM/quantized caching.
+        """
+        info = self.gguf.tensors[name]
+        arena = getattr(self.source, 'arena', None)
+        if arena is None or info.nbytes <= arena.budget:
+            if dtype is None:
+                return self.source.raw_bytes(name).to(device)
+            return self.source.fetch(name, device=device, dtype=dtype)
+
+        from ..io.arena import BudgetExceeded
+        from ..io.source import row_geometry
+
+        n_rows, row_elements, row_bytes = row_geometry(info)
+        if row_bytes > arena.budget:
+            raise BudgetExceeded(
+                f'a row of {name} needs {row_bytes} bytes; raise --mem-budget '
+                f'above the current {arena.budget} bytes'
+            )
+        rows_per_block = max(1, min(arena.budget, 16 << 20) // row_bytes)
+        if dtype is None:
+            result = torch.empty(info.nbytes, dtype=torch.uint8, device=device)
+        else:
+            result = torch.empty((n_rows, row_elements), dtype=dtype, device=device)
+        for start in range(0, n_rows, rows_per_block):
+            end = min(n_rows, start + rows_per_block)
+            if dtype is None:
+                block = self.source.raw_rows(name, start, end)
+                result[start * row_bytes:end * row_bytes].copy_(block)
+            else:
+                block = self.source.fetch_rows(name, start, end, device=device, dtype=dtype)
+                result[start:end].copy_(block)
+            del block
+        return result if dtype is None else result.reshape(info.torch_shape)
+
     def admit_vram(self, name: str) -> bool:
         if name in self._vram:
             return True
@@ -152,12 +192,10 @@ class TieredCache:
             return False
 
         if info.dtype in _FLOAT_TYPES:
-            t = self.source.fetch(
-                name, device=self.device, dtype=self.compute_dtype
-            )
+            t = self._load_resident(name, self.device, self.compute_dtype)
             entry = _Entry(payload=t, nbytes=need, ready=True)
         else:
-            raw = self.source.raw_bytes(name).to(self.device)
+            raw = self._load_resident(name, self.device)
             entry = _Entry(
                 payload=raw, nbytes=need, ready=False, dtype=info.dtype,
                 n_elements=info.n_elements, shape=info.torch_shape,
@@ -177,7 +215,7 @@ class TieredCache:
         if self.stats.ram_bytes + need > self.ram_budget:
             return False
         self._ram[name] = _Entry(
-            payload=self.source.raw_bytes(name), nbytes=need, ready=False,
+            payload=self._load_resident(name, 'cpu'), nbytes=need, ready=False,
             dtype=info.dtype, n_elements=info.n_elements,
             shape=info.torch_shape,
         )
