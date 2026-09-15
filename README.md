@@ -121,6 +121,7 @@ Use the repeatable benchmark to compare block sizes and expert cache budgets:
 python tests/bench_tuning.py --rows 1024,4096,8192 --repeats 2 --output models/_tuning/blocks.json
 python tests/bench_tuning.py --slab-budget 3.5GB --output models/_tuning/cache-3.5GB.json
 python tests/test_tuning.py
+python tests/bench_qwen35.py --suite all --output models/_bench/qwen35.json
 ```
 
 Run one GPU workload at a time. The benchmark replays identical tokens and
@@ -487,7 +488,97 @@ writer, so the index parser is checked against an independent producer, and
 they assert the three translation fixups directly — a checkpoint that skipped
 any of them would load happily and answer wrongly.
 
-Full-model generation and throughput have not been benchmarked.
+### Measured: Qwen3.5-4B on an 8 GB card
+
+```bash
+python tests/bench_qwen35.py --suite vram --repeats 3 --output models/_bench/vram.json
+python tests/bench_qwen35.py --suite all --output models/_bench/all.json
+```
+
+Measured on an RTX 5050 Laptop (8.5 GB) with 16.9 GB host RAM, against the
+9.33 GB safetensors checkpoint in BF16 — a model that does not fit the card.
+Every configuration decodes the same teacher-forced tokens; figures are
+medians over the stated repeats, with the sweep order reversed on alternate
+passes so a warming page cache cannot masquerade as a trend.
+
+**VRAM budget vs latency** (n=3, `reserve-vram 1.5GB`, `block-rows 1024`):
+
+| `--vram-budget` | resident | read/token | ms/token | tok/s | cache hits |
+|---|---|---|---|---|---|
+| 0 | 0.00 GB | 8.42 GB | 7126 | 0.137 | 0% |
+| 1 GB | 0.00 GB | 8.42 GB | 7411 | 0.133 | 0% |
+| 2 GB | 0.54 GB | 7.88 GB | 6484 | 0.154 | 16.3% |
+| 3 GB | 1.61 GB | 6.81 GB | 4340 | 0.207 | 30.1% |
+| 4 GB | 2.68 GB | 5.73 GB | 4361 | 0.229 | 39.9% |
+| 5 GB | 3.76 GB | 4.66 GB | 3354 | 0.286 | 51.2% |
+| 6 GB | 4.83 GB | 3.58 GB | 2548 | 0.379 | 60.6% |
+
+Decode reads every non-resident weight exactly once per token: `read/token`
+tracks `8.42 GB − resident` to within 0.01 GB at every budget. Latency follows
+it, because at ~1 GB/s effective this workload is entirely I/O. The budget is
+what the planner may *spend*, not what it places — `--reserve-vram` is taken
+off the top, which is why 1 GB buys nothing. **All 21 runs produced identical
+output**, which is the memory-ceiling claim stated as a measurement.
+
+**Host RAM as the second tier** (n=2, VRAM held at 4 GB / 2.68 GB resident):
+
+| `--ram-budget` | RAM resident | read/token | ms/token | tok/s | cache hits |
+|---|---|---|---|---|---|
+| 0 | 0.00 GB | 5.73 GB | 4189 | 0.241 | 39.9% |
+| 1 GB | 1.07 GB | 4.66 GB | 3703 | 0.262 | 51.2% |
+| 2 GB | 2.15 GB | 3.58 GB | 3289 | 0.299 | 61.0% |
+| 4 GB | 4.29 GB | 1.44 GB | 2319 | 0.419 | 82.7% |
+| 6 GB | 5.73 GB | **0.00 GB** | 1292 | **0.775** | 100% |
+
+This is the more useful knob on this machine. 2.68 GB of VRAM plus 5.73 GB of
+RAM covers all 8.4 GB of weights, the drive drops out of the loop entirely,
+and throughput reaches **5.7× the no-residency baseline** — roughly twice what
+the best VRAM-only configuration managed, simply because there is more RAM
+available than spare VRAM.
+
+**Context scaling.** Only 8 of 32 layers keep a KV history; the other 24 are
+recurrent and hold fixed-size state. `dense` is what the same depth would cost
+if every layer kept a history:
+
+| context | prefill | prefill tok/s | decode ms | KV + state | dense equivalent |
+|---|---|---|---|---|---|
+| 128 | 7.3 s | 17.6 | 4685 | 55.7 MB | 16.8 MB |
+| 512 | 6.5 s | 79.4 | 4757 | 68.3 MB | 67.1 MB |
+| 1024 | 7.7 s | 133.8 | 3664 | 85.1 MB | 134.2 MB |
+| 2048 | 11.1 s | 185.1 | 3586 | 118.7 MB | 268.4 MB |
+| 4096 | 18.6 s | 220.1 | 3479 | 185.8 MB | 536.9 MB |
+
+The hybrid design costs memory before it saves any. The recurrent state is a
+**fixed ~51.7 MB** regardless of context, so at 128 tokens Qwen3.5 uses 3.3×
+what a dense model of the same shape would; it breaks even near **512 tokens**
+and is at 0.35× by 4096. Growth past the constant is **0.033 MB/token against
+0.131 dense — exactly the 8/32 ratio**. Decode latency is flat across a 32×
+context range, because it is set by weight streaming rather than by attention.
+
+Prefill tok/s rises with length for the same reason: prefill reads the weights
+once for the whole chunk, so a longer prompt amortizes the same I/O.
+
+**Image prefill** carries that to its conclusion — a 1024-token image prefills
+*faster* than a 256-token one, because the cost is one weight pass, not the
+token count:
+
+| `--max-patches` | image tokens | grid | tower encode | prompt | prefill |
+|---|---|---|---|---|---|
+| 256 | 256 | 16×16 | 0.57 s | 278 tok | 9.45 s |
+| 1024 | 1024 | 32×32 | 1.40 s | 1046 tok | 7.62 s |
+
+**Format and block size.** safetensors and BF16 GGUF are equivalent: identical
+5.73 GB/token, and 3712 vs 4043 ms/token (n=3) — a gap inside run-to-run
+variance, so the checkpoint translation costs nothing measurable. Block size
+has a shallow optimum at **1024 rows** (4150 / 3644 / 4244 ms/token for
+256 / 1024 / 4096), matching the finding elsewhere in this README that smaller
+blocks are not automatically better.
+
+Caveats: the OS file cache is not flushed between runs, throughput at these
+rates is dominated by a single drive, and the absolute tok/s carries the same
+PyTorch-level per-call overhead described under
+[the throughput targets](#where-the-throughput-targets-were-missed-and-why).
+Ratios and read-per-token figures are far more reproducible than wall clock.
 
 ## Gemma 4 E4B
 
